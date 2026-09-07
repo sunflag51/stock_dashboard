@@ -1,534 +1,544 @@
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
-from datetime import datetime, time, timedelta
-from typing import Any, Optional, Tuple
-from zoneinfo import ZoneInfo
+import logging
+import time
+from dataclasses import dataclass
+from typing import Final
 
 import pandas as pd
 import yfinance as yf
 
 
-REQUIRED_PRICE_COLUMNS = [
+# ============================================================
+# ログ設定
+# ============================================================
+
+logger = logging.getLogger(__name__)
+
+if not logger.handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    )
+
+
+# ============================================================
+# 定数
+# ============================================================
+
+REQUIRED_COLUMNS: Final[tuple[str, ...]] = (
     "Open",
     "High",
     "Low",
     "Close",
+)
+
+NUMERIC_COLUMNS: Final[tuple[str, ...]] = (
+    "Open",
+    "High",
+    "Low",
+    "Close",
+    "Adj Close",
     "Volume",
-]
+)
 
 
-@dataclass
+# ============================================================
+# 戻り値
+# ============================================================
+
+@dataclass(frozen=True)
 class InstrumentData:
+    """
+    銘柄情報と価格データをまとめた戻り値。
+
+    symbol:
+        アプリで使用する元の銘柄コード。
+        例: AAPL.US、7203.JP
+
+    provider_symbol:
+        Yahoo Financeへ送信した銘柄コード。
+        例: AAPL、7203.T
+
+    prices:
+        正規化済みのOHLCVデータ。
+    """
+
     symbol: str
+    provider_symbol: str
     prices: pd.DataFrame
-    info: dict[str, Any] = field(default_factory=dict)
-    metadata: dict[str, Any] = field(default_factory=dict)
-    source: str = ""
-    dropped_incomplete_bar: bool = False
-    warnings: list[str] = field(default_factory=list)
 
 
-@dataclass
-class MarketBundle:
-    primary: InstrumentData
-    market: Optional[InstrumentData]
-    sector: Optional[InstrumentData]
-    market_symbol: Optional[str]
-    sector_symbol: Optional[str]
-    warnings: list[str] = field(default_factory=list)
+# ============================================================
+# 銘柄コード変換
+# ============================================================
 
-
-class MarketDataProvider(ABC):
+def normalize_yahoo_symbol(symbol: str) -> str:
     """
-    yfinanceや将来追加するデータ取得元を統一するインターフェースです。
+    アプリ側の銘柄コードをYahoo Finance形式へ変換する。
+
+    主な変換例:
+        AAPL.US   -> AAPL
+        7203.JP   -> 7203.T
+         00700.HK   -> 0700.HK
+
+    未対応のサフィックスは、そのまま返す。
     """
 
-    name: str = "unknown"
-
-    @abstractmethod
-    def get_instrument(
-        self,
-        symbol: str,
-        period: str = "5y",
-        include_info: bool = False,
-        exclude_incomplete: bool = True,
-    ) -> InstrumentData:
-        raise NotImplementedError
-
-
-def normalize_symbol(symbol: str) -> str:
-    symbol = str(symbol or "").upper().strip()
-
-    if not symbol:
-        raise ValueError("銘柄コードを入力してください。")
-
-    if len(symbol) > 30:
-        raise ValueError("銘柄コードが長すぎます。")
-
-    allowed_characters = set(
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-^=_/"
-    )
-
-    if any(character not in allowed_characters for character in symbol):
-        raise ValueError(
-            "銘柄コードに使用できない文字が含まれています。"
+    if not isinstance(symbol, str):
+        raise TypeError(
+            f"銘柄コードは文字列で指定してください: {type(symbol).__name__}"
         )
 
-    return symbol
+    value = symbol.strip().upper()
+
+    if not value:
+        raise ValueError("銘柄コードが空です。")
+
+    # 米国株
+    if value.endswith(".US"):
+        return value[:-3]
+
+    # 日本株
+    if value.endswith(".JP"):
+        base = value[:-3]
+        if not base:
+            raise ValueError(f"無効な日本株コードです: {symbol!r}")
+        return f"{base}.T"
+
+    # 中国香港上場銘柄
+    if value.endswith(".HK"):
+        base = value[:-3]
+
+        if base.isdigit():
+            # Yahoo Financeでは通常4桁形式
+            base = base.zfill(4)[-4:]
+
+        return f"{base}.HK"
+
+    return value
 
 
-def get_benchmark_symbols(
-    symbol: str,
-) -> Tuple[Optional[str], Optional[str]]:
+# ============================================================
+# DataFrame正規化
+# ============================================================
+
+def _flatten_yfinance_columns(
+    frame: pd.DataFrame,
+    provider_symbol: str,
+) -> pd.DataFrame:
     """
-    銘柄に対応する市場ベンチマークとセクターETFを返します。
+    yfinanceが返すMultiIndex列を通常の列へ変換する。
+
+    yfinanceのバージョンや取得方法によって、次のような形式に
+    なる場合がある。
+
+        ('Close', 'AAPL')
+        ('AAPL', 'Close')
+
+    OHLCV名が含まれる階層を自動判定する。
     """
-    symbol = normalize_symbol(symbol)
 
-    if symbol.endswith(".T"):
-        return "^N225", None
-
-    sector_map = {
-        # 半導体
-        "NVDA": "SMH",
-        "AMD": "SMH",
-        "TSM": "SMH",
-        "AVGO": "SMH",
-        "INTC": "SMH",
-        "QCOM": "SMH",
-        "ARM": "SMH",
-        "MU": "SMH",
-        "ASML": "SMH",
-
-        # 情報技術
-        "AAPL": "XLK",
-        "MSFT": "XLK",
-        "CRM": "XLK",
-        "ORCL": "XLK",
-        "ADBE": "XLK",
-        "IBM": "XLK",
-        "ACN": "XLK",
-
-        # コミュニケーション
-        "GOOG": "XLC",
-        "GOOGL": "XLC",
-        "META": "XLC",
-        "NFLX": "XLC",
-        "DIS": "XLC",
-        "TMUS": "XLC",
-        "VZ": "XLC",
-        "T": "XLC",
-
-        # 一般消費財
-        "AMZN": "XLY",
-        "TSLA": "XLY",
-        "NKE": "XLY",
-        "HD": "XLY",
-        "MCD": "XLY",
-        "LOW": "XLY",
-        "SBUX": "XLY",
-
-        # 生活必需品
-        "KO": "XLP",
-        "PEP": "XLP",
-        "PG": "XLP",
-        "KDP": "XLP",
-        "COST": "XLP",
-        "WMT": "XLP",
-        "TGT": "XLP",
-        "BJ": "XLP",
-
-        # 金融
-        "V": "XLF",
-        "MA": "XLF",
-        "AXP": "XLF",
-        "PYPL": "XLF",
-        "JPM": "XLF",
-        "BAC": "XLF",
-        "GS": "XLF",
-        "MS": "XLF",
-        "WFC": "XLF",
-
-        # ヘルスケア
-        "ISRG": "XLV",
-        "JNJ": "XLV",
-        "UNH": "XLV",
-        "MDT": "XLV",
-        "SYK": "XLV",
-        "PFE": "XLV",
-        "MRK": "XLV",
-        "LLY": "XLV",
-        "ABBV": "XLV",
-
-        # エネルギー
-        "XOM": "XLE",
-        "CVX": "XLE",
-        "COP": "XLE",
-        "SLB": "XLE",
-
-        # 資本財
-        "CAT": "XLI",
-        "BA": "XLI",
-        "GE": "XLI",
-        "HON": "XLI",
-        "UPS": "XLI",
-
-        # 公益
-        "NEE": "XLU",
-        "DUK": "XLU",
-        "SO": "XLU",
-
-        # 不動産
-        "AMT": "XLRE",
-        "PLD": "XLRE",
-        "EQIX": "XLRE",
-
-        # 素材
-        "LIN": "XLB",
-        "FCX": "XLB",
-        "NEM": "XLB",
-        "DOW": "XLB",
-    }
-
-    return "SPY", sector_map.get(symbol)
-
-
-def _default_timezone_for_symbol(symbol: str) -> str:
-    if symbol.endswith(".T") or symbol == "^N225":
-        return "Asia/Tokyo"
-
-    if symbol.endswith(".L"):
-        return "Europe/London"
-
-    if symbol.endswith(".TO"):
-        return "America/Toronto"
-
-    if symbol.endswith(".AX"):
-        return "Australia/Sydney"
-
-    if symbol.endswith(".HK"):
-        return "Asia/Hong_Kong"
-
-    return "America/New_York"
-
-
-def _market_close_time(timezone_name: str) -> time:
-    close_times = {
-        "America/New_York": time(16, 0),
-        "America/Toronto": time(16, 0),
-        "Asia/Tokyo": time(15, 30),
-        "Europe/London": time(16, 30),
-        "Europe/Berlin": time(17, 30),
-        "Australia/Sydney": time(16, 0),
-        "Asia/Hong_Kong": time(16, 0),
-    }
-
-    return close_times.get(timezone_name, time(16, 0))
-
-
-def _flatten_yfinance_columns(df: pd.DataFrame) -> pd.DataFrame:
-    result = df.copy()
-
-    if not isinstance(result.columns, pd.MultiIndex):
+    if not isinstance(frame.columns, pd.MultiIndex):
+        result = frame.copy()
+        result.columns = [str(column).strip() for column in result.columns]
         return result
 
-    best_level = 0
-    best_score = -1
+    known_columns = {
+        "Open",
+        "High",
+        "Low",
+        "Close",
+        "Adj Close",
+        "Volume",
+    }
 
-    for level in range(result.columns.nlevels):
-        values = {
-            str(value)
-            for value in result.columns.get_level_values(level)
-        }
-        score = len(values.intersection(REQUIRED_PRICE_COLUMNS))
+    level_zero = {
+        str(value).strip()
+        for value in frame.columns.get_level_values(0)
+    }
+    level_one = {
+        str(value).strip()
+        for value in frame.columns.get_level_values(1)
+    }
 
-        if score > best_score:
-            best_score = score
-            best_level = level
+    result = frame.copy()
 
-    result.columns = result.columns.get_level_values(best_level)
-    result = result.loc[
-        :,
-        ~pd.Index(result.columns).duplicated(keep="last"),
+    if known_columns.intersection(level_zero):
+        result.columns = [
+            str(column[0]).strip()
+            for column in result.columns
+        ]
+        return result
+
+    if known_columns.intersection(level_one):
+        result.columns = [
+            str(column[1]).strip()
+            for column in result.columns
+        ]
+        return result
+
+    raise ValueError(
+        f"{provider_symbol}の列構造を判定できませんでした。"
+        f"columns={list(frame.columns)!r}"
+    )
+
+
+def _normalize_price_frame(
+    frame: pd.DataFrame,
+    provider_symbol: str,
+) -> pd.DataFrame:
+    """
+    Yahoo Financeの取得結果をアプリで扱いやすい形式へ正規化する。
+    """
+
+    if frame is None:
+        raise ValueError(
+            f"{provider_symbol}の価格データがNoneでした。"
+        )
+
+    if not isinstance(frame, pd.DataFrame):
+        raise TypeError(
+            f"{provider_symbol}の取得結果がDataFrameではありません。"
+            f"type={type(frame).__name__}"
+        )
+
+    if frame.empty:
+        raise ValueError(
+            f"{provider_symbol}の価格データが空です。"
+            "銘柄コード、期間、時間足を確認してください。"
+        )
+
+    result = _flatten_yfinance_columns(
+        frame=frame,
+        provider_symbol=provider_symbol,
+    )
+
+    # 同名列が重複した場合は最初の列を使用
+    result = result.loc[:, ~result.columns.duplicated()].copy()
+
+    missing_columns = [
+        column
+        for column in REQUIRED_COLUMNS
+        if column not in result.columns
     ]
 
-    return result
+    if missing_columns:
+        raise KeyError(
+            f"{provider_symbol}の価格データに必要な列がありません。"
+            f"不足列={missing_columns}, "
+            f"取得列={list(result.columns)}"
+        )
 
+    # 必要な列だけを残す
+    available_columns = [
+        column
+        for column in NUMERIC_COLUMNS
+        if column in result.columns
+    ]
 
-def _normalize_price_frame(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return pd.DataFrame(columns=REQUIRED_PRICE_COLUMNS)
+    result = result[available_columns].copy()
 
-    result = _flatten_yfinance_columns(df)
-
-    for column in REQUIRED_PRICE_COLUMNS:
-        if column not in result.columns:
-            result[column] = pd.NA
-
-    result = result[REQUIRED_PRICE_COLUMNS].copy()
-
-    try:
-        result.index = pd.to_datetime(result.index)
-    except Exception:
-        pass
-
-    result = result[
-        ~result.index.duplicated(keep="last")
-    ].sort_index()
-
-    for column in REQUIRED_PRICE_COLUMNS:
+    # 数値変換
+    for column in available_columns:
         result[column] = pd.to_numeric(
             result[column],
             errors="coerce",
         )
 
-    result = result.replace([float("inf"), float("-inf")], pd.NA)
+    # OHLCが欠損している行は除外
     result = result.dropna(
-        subset=["Open", "High", "Low", "Close"]
+        subset=list(REQUIRED_COLUMNS),
+        how="any",
     )
 
-    valid_prices = (
-        (result["Open"] > 0)
-        & (result["High"] > 0)
-        & (result["Low"] > 0)
-        & (result["Close"] > 0)
-        & (result["High"] >= result["Low"])
-    )
+    if result.empty:
+        raise ValueError(
+            f"{provider_symbol}は数値変換後に有効な価格データが"
+            "残りませんでした。"
+        )
 
-    result = result.loc[valid_prices].copy()
-    result["Volume"] = result["Volume"].fillna(0).clip(lower=0)
+    # DatetimeIndexへ変換
+    try:
+        result.index = pd.to_datetime(
+            result.index,
+            errors="raise",
+        )
+    except Exception as exc:
+        raise ValueError(
+            f"{provider_symbol}の日付インデックスを変換できませんでした。"
+            f"[{type(exc).__name__}]: {exc}"
+        ) from exc
+
+    # タイムゾーン情報を除去して比較しやすくする
+    if isinstance(result.index, pd.DatetimeIndex):
+        if result.index.tz is not None:
+            result.index = result.index.tz_convert("UTC").tz_localize(None)
+
+    result.index.name = "Date"
+
+    # 重複日時を除外
+    result = result.loc[
+        ~result.index.duplicated(keep="last")
+    ]
+
+    result = result.sort_index()
+
+    if result.empty:
+        raise ValueError(
+            f"{provider_symbol}の正規化後データが空です。"
+        )
 
     return result
 
 
-def _exclude_incomplete_daily_bar(
-    df: pd.DataFrame,
-    timezone_name: str,
-    grace_minutes: int = 20,
-) -> Tuple[pd.DataFrame, bool]:
+# ============================================================
+# 未確定ローソク足の判定
+# ============================================================
+
+def _interval_to_timedelta(interval: str) -> pd.Timedelta | None:
     """
-    当日の日足が市場終了前の場合に、その足を除外します。
+    yfinanceのintervalを、おおよその時間幅へ変換する。
 
-    短縮取引日や臨時休場を完全に判定する取引所カレンダーではなく、
-    通常の市場終了時刻を使った安全側の簡易判定です。
+    月足は月ごとの日数が異なるため、未確定判定を行わない。
     """
-    if df.empty:
-        return df, False
 
-    try:
-        market_tz = ZoneInfo(timezone_name)
-    except Exception:
-        timezone_name = "America/New_York"
-        market_tz = ZoneInfo(timezone_name)
+    interval_map: dict[str, pd.Timedelta] = {
+        "1m": pd.Timedelta(minutes=1),
+        "2m": pd.Timedelta(minutes=2),
+        "5m": pd.Timedelta(minutes=5),
+        "15m": pd.Timedelta(minutes=15),
+        "30m": pd.Timedelta(minutes=30),
+        "60m": pd.Timedelta(hours=1),
+        "90m": pd.Timedelta(minutes=90),
+        "1h": pd.Timedelta(hours=1),
+        "1d": pd.Timedelta(days=1),
+        "5d": pd.Timedelta(days=5),
+        "1wk": pd.Timedelta(weeks=1),
+    }
 
-    now_market = datetime.now(market_tz)
-    last_timestamp = pd.Timestamp(df.index[-1])
+    return interval_map.get(interval.lower().strip())
+
+
+def _exclude_incomplete_last_row(
+    frame: pd.DataFrame,
+    interval: str,
+) -> pd.DataFrame:
+    """
+    現在時刻から見て未確定と考えられる最後の行だけを除外する。
+
+    単純に常時最終行を削除すると、過去期間の確定済みデータまで
+    削除するため、終了時刻を使って判定する。
+    """
+
+    if len(frame) <= 1:
+        return frame
+
+    interval_delta = _interval_to_timedelta(interval)
+
+    if interval_delta is None:
+        return frame
+
+    last_timestamp = pd.Timestamp(frame.index[-1])
 
     if last_timestamp.tzinfo is not None:
-        last_date = last_timestamp.tz_convert(market_tz).date()
-    else:
-        last_date = last_timestamp.date()
+        last_timestamp = last_timestamp.tz_convert("UTC").tz_localize(None)
 
-    today_market = now_market.date()
+    now_utc = pd.Timestamp.now(tz="UTC").tz_localize(None)
+    expected_close = last_timestamp + interval_delta
 
-    if last_date < today_market:
-        return df, False
+    if now_utc < expected_close:
+        return frame.iloc[:-1].copy()
 
-    if last_date > today_market:
-        return df.iloc[:-1].copy(), True
-
-    close_datetime = datetime.combine(
-        today_market,
-        _market_close_time(timezone_name),
-        tzinfo=market_tz,
-    )
-
-    complete_after = close_datetime + timedelta(
-        minutes=max(0, grace_minutes)
-    )
-
-    if now_market < complete_after:
-        return df.iloc[:-1].copy(), True
-
-    return df, False
+    return frame
 
 
-class YahooFinanceProvider(MarketDataProvider):
-    name = "yfinance"
+# ============================================================
+# Yahoo Finance取得
+# ============================================================
 
-    def get_instrument(
-        self,
-        symbol: str,
-        period: str = "5y",
-        include_info: bool = False,
-        exclude_incomplete: bool = True,
-    ) -> InstrumentData:
-        symbol = normalize_symbol(symbol)
-        warnings: list[str] = []
+def _download_prices(
+    provider_symbol: str,
+    period: str,
+    interval: str,
+    auto_adjust: bool,
+    timeout: int,
+) -> pd.DataFrame:
+    """
+    yfinance.download()を呼び出す。
+    """
 
-        ticker = yf.Ticker(symbol)
-
-        try:
-            raw_df = ticker.history(
-                period=period,
-                interval="1d",
-                auto_adjust=True,
-                actions=False,
-                repair=True,
-                timeout=20,
-            )
-        except TypeError:
-            # 一部のyfinanceバージョンで未対応の引数がある場合
-            try:
-                raw_df = ticker.history(
-                    period=period,
-                    interval="1d",
-                    auto_adjust=True,
-                    actions=False,
-                )
-            except Exception as exc:
-                raise RuntimeError(
-                    f"{symbol}の価格データ取得に失敗しました: {exc}"
-                ) from exc
-        except Exception as exc:
-            raise RuntimeError(
-                f"{symbol}の価格データ取得に失敗しました: {exc}"
-            ) from exc
-
-        prices = _normalize_price_frame(raw_df)
-
-        metadata: dict[str, Any] = {}
-
-        try:
-            metadata = ticker.get_history_metadata() or {}
-        except Exception:
-            warnings.append(
-                f"{symbol}の市場メタデータを取得できませんでした。"
-            )
-
-        timezone_name = (
-            metadata.get("exchangeTimezoneName")
-            or metadata.get("timezone")
-            or _default_timezone_for_symbol(symbol)
-        )
-
-        dropped = False
-
-        if exclude_incomplete and not prices.empty:
-            prices, dropped = _exclude_incomplete_daily_bar(
-                prices=prices,
-                timezone_name=str(timezone_name),
-            )
-
-        info: dict[str, Any] = {}
-
-        if include_info:
-            try:
-                info = ticker.info or {}
-            except Exception:
-                warnings.append(
-                    f"{symbol}の企業情報を取得できなかったため、"
-                    "ファンダメンタルズは一部欠損扱いになります。"
-                )
-
-        if dropped:
-            warnings.append(
-                f"{symbol}の未確定と判断された当日足を除外しました。"
-            )
-
-        if prices.empty:
-            warnings.append(
-                f"{symbol}の有効な価格データがありません。"
-            )
-        elif len(prices) < 50:
-            warnings.append(
-                f"{symbol}の価格履歴が50営業日未満です。"
-                "分析精度が低下する可能性があります。"
-            )
-
-        return InstrumentData(
-            symbol=symbol,
-            prices=prices,
-            info=info,
-            metadata=metadata,
-            source=self.name,
-            dropped_incomplete_bar=dropped,
-            warnings=warnings,
-        )
-
-
-def create_provider(
-    provider_name: str = "yfinance",
-) -> MarketDataProvider:
-    normalized = str(provider_name).lower().strip()
-
-    if normalized == "yfinance":
-        return YahooFinanceProvider()
-
-    raise ValueError(
-        f"未対応のデータプロバイダーです: {provider_name}"
+    return yf.download(
+        tickers=provider_symbol,
+        period=period,
+        interval=interval,
+        auto_adjust=auto_adjust,
+        progress=False,
+        threads=False,
+        group_by="column",
+        timeout=timeout,
     )
 
 
-def load_market_bundle(
-    provider_name: str,
+def get_instrument(
     symbol: str,
-) -> MarketBundle:
-    symbol = normalize_symbol(symbol)
-    provider = create_provider(provider_name)
+    period: str = "1y",
+    interval: str = "1d",
+    exclude_incomplete: bool = True,
+    auto_adjust: bool = False,
+    retries: int = 3,
+    retry_delay: float = 2.0,
+    timeout: int = 20,
+) -> InstrumentData:
+    """
+    指定銘柄の価格データを取得する。
 
-    market_symbol, sector_symbol = get_benchmark_symbols(symbol)
+    Parameters
+    ----------
+    symbol:
+        アプリ側の銘柄コード。
+        例: AAPL.US、7203.JP
 
-    primary = provider.get_instrument(
+    period:
+        yfinanceの取得期間。
+        例: 1mo、3mo、6mo、1y、2y、5y、max
+
+    interval:
+        yfinanceの時間足。
+        例: 1m、5m、1h、1d、1wk、1mo
+
+    exclude_incomplete:
+        Trueの場合、未確定と判断できる最終行を除外する。
+
+    auto_adjust:
+        Trueの場合、株式分割・配当を考慮した調整価格を使用する。
+
+    retries:
+        最大試行回数。
+
+    retry_delay:
+        再試行までの待機秒数。
+
+    timeout:
+        yfinanceへのリクエストタイムアウト秒数。
+
+    Returns
+    -------
+    InstrumentData
+        元の銘柄コード、データ提供元のコード、価格DataFrame。
+    """
+
+    original_symbol = symbol.strip().upper()
+    provider_symbol = normalize_yahoo_symbol(original_symbol)
+
+    if retries < 1:
+        raise ValueError("retriesは1以上で指定してください。")
+
+    if retry_delay < 0:
+        raise ValueError("retry_delayは0以上で指定してください。")
+
+    if timeout <= 0:
+        raise ValueError("timeoutは1以上で指定してください。")
+
+    last_exception: Exception | None = None
+
+    for attempt in range(1, retries + 1):
+        try:
+            logger.info(
+                "価格データを取得します: symbol=%s, provider_symbol=%s, "
+                "period=%s, interval=%s, attempt=%d/%d",
+                original_symbol,
+                provider_symbol,
+                period,
+                interval,
+                attempt,
+                retries,
+            )
+
+            raw_prices = _download_prices(
+                provider_symbol=provider_symbol,
+                period=period,
+                interval=interval,
+                auto_adjust=auto_adjust,
+                timeout=timeout,
+            )
+
+            prices = _normalize_price_frame(
+                frame=raw_prices,
+                provider_symbol=provider_symbol,
+            )
+
+            if exclude_incomplete:
+                prices = _exclude_incomplete_last_row(
+                    frame=prices,
+                    interval=interval,
+                )
+
+            if prices.empty:
+                raise ValueError(
+                    f"{provider_symbol}は未確定データ除外後に"
+                    "価格データが空になりました。"
+                )
+
+            logger.info(
+                "価格データの取得に成功しました: symbol=%s, rows=%d",
+                original_symbol,
+                len(prices),
+            )
+
+            return InstrumentData(
+                symbol=original_symbol,
+                provider_symbol=provider_symbol,
+                prices=prices,
+            )
+
+        except Exception as exc:
+            last_exception = exc
+
+            logger.exception(
+                "価格データ取得に失敗しました: "
+                "symbol=%s, provider_symbol=%s, attempt=%d/%d",
+                original_symbol,
+                provider_symbol,
+                attempt,
+                retries,
+            )
+
+            if attempt < retries:
+                time.sleep(retry_delay * attempt)
+
+    assert last_exception is not None
+
+    raise RuntimeError(
+        f"{original_symbol}の価格データ取得に失敗しました。"
+        f"Yahoo Financeコード={provider_symbol}, "
+        f"period={period}, interval={interval}, "
+        f"原因=[{type(last_exception).__name__}]: "
+        f"{last_exception!r}"
+    ) from last_exception
+
+
+# ============================================================
+# DataFrameだけ必要な場合の簡易関数
+# ============================================================
+
+def get_price_data(
+    symbol: str,
+    period: str = "1y",
+    interval: str = "1d",
+    exclude_incomplete: bool = True,
+    auto_adjust: bool = False,
+) -> pd.DataFrame:
+    """
+    InstrumentDataではなく価格DataFrameだけを返す。
+    """
+
+    instrument = get_instrument(
         symbol=symbol,
-        period="5y",
-        include_info=True,
-        exclude_incomplete=True,
+        period=period,
+        interval=interval,
+        exclude_incomplete=exclude_incomplete,
+        auto_adjust=auto_adjust,
     )
 
-    warnings = list(primary.warnings)
-
-    market: Optional[InstrumentData] = None
-
-    if market_symbol and market_symbol != symbol:
-        try:
-            market = provider.get_instrument(
-                symbol=market_symbol,
-                period="1y",
-                include_info=False,
-                exclude_incomplete=True,
-            )
-            warnings.extend(market.warnings)
-        except Exception as exc:
-            warnings.append(
-                f"市場データ（{market_symbol}）を"
-                f"取得できませんでした: {exc}"
-            )
-
-    sector: Optional[InstrumentData] = None
-
-    if sector_symbol and sector_symbol not in {symbol, market_symbol}:
-        try:
-            sector = provider.get_instrument(
-                symbol=sector_symbol,
-                period="1y",
-                include_info=False,
-                exclude_incomplete=True,
-            )
-            warnings.extend(sector.warnings)
-        except Exception as exc:
-            warnings.append(
-                f"セクターデータ（{sector_symbol}）を"
-                f"取得できませんでした: {exc}"
-            )
-
-    return MarketBundle(
-        primary=primary,
-        market=market,
-        sector=sector,
-        market_symbol=market_symbol,
-        sector_symbol=sector_symbol,
-        warnings=warnings,
-    )
+    return instrument.prices.copy()
