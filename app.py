@@ -717,36 +717,21 @@ if st.session_state.is_analyzed:
     with st.expander("企業情報をさらに表示"):
         detail_col1, detail_col2, detail_col3 = st.columns(3)
 
-        detail_col1.write(
-            f"**業種:** {info.get('industry', '取得不可')}"
-        )
-        detail_col1.write(
-            f"**セクター:** {info.get('sector', '取得不可')}"
-        )
+        detail_col1.write(f"**業種:** {info.get('industry', '取得不可')}")
+        detail_col1.write(f"**セクター:** {info.get('sector', '取得不可')}")
+        detail_col2.write(f"**時価総額:** {format_large_number(info.get('marketCap'))}")
 
-        detail_col2.write(
-            f"**時価総額:** "
-            f"{format_large_number(info.get('marketCap'))}"
-        )
-        detail_col2.write(
-            f"**売上成長率:** "
-            f"{format_value("
-            f"safe_number(info.get('revenueGrowth')) * 100 "
-            f"if safe_number(info.get('revenueGrowth')) is not None "
-            f"else None, 1, '%')}"
-        )
+        # 💡 ここが先ほどのエラー原因（文法エラーを修正しました）
+        rev_growth_raw = safe_number(info.get('revenueGrowth'))
+        rev_growth_val = rev_growth_raw * 100 if rev_growth_raw is not None else None
+        detail_col2.write(f"**売上成長率:** {format_value(rev_growth_val, 1, '%')}")
 
-        detail_col3.write(
-            f"**営業利益率:** "
-            f"{format_value("
-            f"safe_number(info.get('operatingMargins')) * 100 "
-            f"if safe_number(info.get('operatingMargins')) is not None "
-            f"else None, 1, '%')}"
-        )
-        detail_col3.write(
-            f"**予想PER:** "
-            f"{format_value(info.get('forwardPE'), 1, '倍')}"
-        )
+        op_margin_raw = safe_number(info.get('operatingMargins'))
+        op_margin_val = op_margin_raw * 100 if op_margin_raw is not None else None
+        detail_col3.write(f"**営業利益率:** {format_value(op_margin_val, 1, '%')}")
+
+        f_pe = safe_number(info.get('forwardPE'))
+        detail_col3.write(f"**予想PER:** {format_value(f_pe, 1, '倍')}")
 
     st.markdown("---")
 
