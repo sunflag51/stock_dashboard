@@ -1,1013 +1,745 @@
 from __future__ import annotations
 
-import html
+from typing import Any, Optional
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-from analysis_engine import (
-    add_indicators,
-    calculate_score,
-    detect_candlestick_patterns,
-    detect_market_structure,
-    safe_number,
+from analysis_engine import AnalysisResult, analyze_stock
+from data_provider import (
+    MarketBundle,
+    load_market_bundle,
+    normalize_symbol,
 )
-from data_provider import load_market_bundle
 
 
-# =========================================================
-# Streamlit基本設定
-# =========================================================
 st.set_page_config(
-    page_title="株価分析ダッシュボード",
+    page_title="株式分析ダッシュボード",
     page_icon="📈",
     layout="wide",
 )
 
 
-SHEET_LINK = (
-    "https://docs.google.com/spreadsheets/d/"
-    "1XZwIJaNVQG-q5SMVJQOXsvcsexTU0eVUCbaH7zscMnU/"
-    "edit?usp=drivesdk"
+st.markdown(
+    """
+    <style>
+    .block-container {
+        padding-top: 1.3rem;
+        padding-bottom: 3rem;
+    }
+
+    div[data-testid="stMetric"] {
+        background: rgba(128, 128, 128, 0.07);
+        border: 1px solid rgba(128, 128, 128, 0.22);
+        border-radius: 10px;
+        padding: 12px;
+    }
+
+    .result-card {
+        padding: 18px;
+        border: 1px solid rgba(128, 128, 128, 0.25);
+        border-radius: 12px;
+        margin-bottom: 12px;
+    }
+
+    .small-note {
+        color: #777;
+        font-size: 0.86rem;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
 )
 
-BASE_OPTIONS = [
-    "NVDA (エヌビディア)",
-    "GOOG (アルファベット)",
-    "KO (コカ・コーラ)",
-    "V (ビザ)",
-    "AAPL (アップル)",
-    "ISRG (インテュイティブ・サージカル)",
-    "COST (コストコ)",
-    "MSFT (マイクロソフト)",
-]
 
-
-# =========================================================
-# キャッシュ
-# =========================================================
-@st.cache_data(ttl=300, show_spinner=False)
-def get_cached_bundle(provider_name: str, symbol: str):
+@st.cache_data(
+    ttl=900,
+    show_spinner=False,
+)
+def cached_load_market_bundle(
+    provider_name: str,
+    symbol: str,
+) -> MarketBundle:
     return load_market_bundle(
         provider_name=provider_name,
         symbol=symbol,
     )
 
 
-@st.cache_data(ttl=600, show_spinner=False)
-def load_sheet_options(sheet_link: str) -> tuple[list[str], str | None]:
-    if not sheet_link.startswith("http"):
-        return [], None
-
+def safe_float(value: Any) -> Optional[float]:
     try:
-        csv_url = sheet_link.split("/edit")[0] + "/export?format=csv"
-        sheet_df = pd.read_csv(csv_url, header=None)
+        converted = float(value)
 
-        options: list[str] = []
+        if np.isfinite(converted):
+            return converted
+    except (TypeError, ValueError):
+        pass
 
-        for _, row in sheet_df.iterrows():
-            if len(row) < 2:
-                continue
-
-            company = str(row.iloc[0]).strip()
-            code = str(row.iloc[1]).strip().upper()
-
-            invalid_names = {
-                "",
-                "企業名",
-                "名前",
-                "会社名",
-                "NAN",
-                "NONE",
-            }
-
-            if company.upper() in invalid_names:
-                continue
-
-            if code.upper() in {"", "NAN", "NONE", "銘柄コード"}:
-                continue
-
-            options.append(f"{code} ({company})")
-
-        return options, None
-
-    except Exception as exc:
-        return [], str(exc)
+    return None
 
 
-# =========================================================
-# 表示用関数
-# =========================================================
-def format_value(
-    value,
-    digits: int = 2,
+def format_number(
+    value: Any,
+    decimals: int = 2,
     suffix: str = "",
-    unavailable: str = "取得不可",
+    missing: str = "－",
 ) -> str:
-    number = safe_number(value)
+    number = safe_float(value)
 
     if number is None:
-        return unavailable
+        return missing
 
-    return f"{number:,.{digits}f}{suffix}"
+    return f"{number:,.{decimals}f}{suffix}"
 
 
-def format_large_number(value) -> str:
-    number = safe_number(value)
+def format_large_number(value: Any) -> str:
+    number = safe_float(value)
 
     if number is None:
-        return "取得不可"
+        return "－"
 
-    abs_number = abs(number)
+    absolute = abs(number)
 
-    if abs_number >= 1_000_000_000_000:
-        return f"{number / 1_000_000_000_000:.2f}兆"
-    if abs_number >= 1_000_000_000:
-        return f"{number / 1_000_000_000:.2f}十億"
-    if abs_number >= 1_000_000:
-        return f"{number / 1_000_000:.2f}百万"
+    if absolute >= 1_000_000_000_000:
+        return f"{number / 1_000_000_000_000:,.2f}兆"
+
+    if absolute >= 1_000_000_000:
+        return f"{number / 1_000_000_000:,.2f}十億"
+
+    if absolute >= 1_000_000:
+        return f"{number / 1_000_000:,.2f}百万"
 
     return f"{number:,.0f}"
 
 
-def get_currency_symbol(
-    info: dict,
-    metadata: dict,
-    ticker: str,
-) -> tuple[str, str]:
-    currency = (
-        info.get("currency")
-        or metadata.get("currency")
-        or ""
-    )
+def percent_from_ratio(value: Any) -> str:
+    number = safe_float(value)
 
-    if not currency:
-        currency = "JPY" if ticker.endswith(".T") else "USD"
+    if number is None:
+        return "－"
 
-    currency_symbols = {
-        "USD": "$",
-        "JPY": "¥",
-        "EUR": "€",
-        "GBP": "£",
-        "CAD": "C$",
-        "AUD": "A$",
-        "HKD": "HK$",
-    }
-
-    return currency_symbols.get(currency, f"{currency} "), currency
+    return f"{number * 100:,.2f}%"
 
 
-def format_dividend_yield(value) -> str:
-    dividend_yield = safe_number(value)
+def create_chart(result: AnalysisResult):
+    frame = result.frame.tail(260).copy()
 
-    if dividend_yield is None:
-        return "取得不可"
-
-    # Yahooでは通常、小数形式で返る
-    if abs(dividend_yield) <= 1:
-        dividend_yield *= 100
-
-    return f"{dividend_yield:.2f}%"
-
-
-def prepare_chart_data(
-    df: pd.DataFrame,
-    display_period: str,
-) -> pd.DataFrame:
-    period_rows = {
-        "3ヶ月": 65,
-        "6ヶ月": 130,
-        "1年": 260,
-        "5年": 1300,
-    }
-
-    rows = period_rows.get(display_period, 130)
-    return df.tail(rows).copy()
-
-
-def draw_chart(
-    df: pd.DataFrame,
-    ticker: str,
-    chart_mode: str,
-    show_ichimoku: bool,
-):
-    fig, axes = plt.subplots(
-        5,
+    figure, axes = plt.subplots(
+        3,
         1,
-        figsize=(12, 16),
+        figsize=(14, 10),
         sharex=True,
         gridspec_kw={
-            "height_ratios": [3, 1, 1, 1, 1],
+            "height_ratios": [3.2, 1.1, 1.4],
+            "hspace": 0.08,
         },
     )
 
-    ax_price, ax_volume, ax_macd, ax_rsi, ax_kdj = axes
+    price_axis, volume_axis, macd_axis = axes
 
-    if chart_mode == "ローソク足":
-        up = df["Close"] >= df["Open"]
-        down = df["Close"] < df["Open"]
+    price_axis.plot(
+        frame.index,
+        frame["Close"],
+        color="#1565C0",
+        linewidth=1.6,
+        label="Close",
+    )
 
-        ax_price.vlines(
-            df.index,
-            df["Low"],
-            df["High"],
-            color="#444444",
-            linewidth=0.8,
+    price_axis.plot(
+        frame.index,
+        frame["SMA20"],
+        color="#FB8C00",
+        linewidth=1.0,
+        label="SMA20",
+    )
+
+    price_axis.plot(
+        frame.index,
+        frame["SMA50"],
+        color="#8E24AA",
+        linewidth=1.0,
+        label="SMA50",
+    )
+
+    if frame["SMA200"].notna().any():
+        price_axis.plot(
+            frame.index,
+            frame["SMA200"],
+            color="#455A64",
+            linewidth=1.0,
+            label="SMA200",
         )
 
-        ax_price.bar(
-            df.index[up],
-            df.loc[up, "Close"] - df.loc[up, "Open"],
-            bottom=df.loc[up, "Open"],
-            color="#ef5350",
-            edgecolor="#ef5350",
-            width=0.65,
-            label="Up",
-        )
-
-        ax_price.bar(
-            df.index[down],
-            df.loc[down, "Open"] - df.loc[down, "Close"],
-            bottom=df.loc[down, "Close"],
-            color="#26a69a",
-            edgecolor="#26a69a",
-            width=0.65,
-            label="Down",
-        )
-    else:
-        ax_price.plot(
-            df.index,
-            df["Close"],
-            color="black",
-            linewidth=1.8,
-            label="Close",
-        )
-
-    ax_price.plot(
-        df.index,
-        df["MA5"],
-        color="#ff9800",
-        linewidth=1,
-        label="MA5",
-    )
-    ax_price.plot(
-        df.index,
-        df["MA20"],
-        color="#1565c0",
-        linewidth=1.2,
-        label="MA20",
-    )
-    ax_price.plot(
-        df.index,
-        df["MA50"],
-        color="#7b1fa2",
-        linewidth=1,
-        label="MA50",
-    )
-    ax_price.plot(
-        df.index,
-        df["Upper"],
-        color="#2e7d32",
-        linewidth=0.8,
-        linestyle=":",
-        alpha=0.7,
-        label="BOLL +2σ",
-    )
-    ax_price.plot(
-        df.index,
-        df["Lower"],
-        color="#2e7d32",
-        linewidth=0.8,
-        linestyle=":",
-        alpha=0.7,
-        label="BOLL -2σ",
-    )
-
-    if show_ichimoku:
-        ax_price.plot(
-            df.index,
-            df["Tenkan"],
-            color="darkorange",
-            linewidth=1,
-            label="Tenkan",
-        )
-        ax_price.plot(
-            df.index,
-            df["Kijun"],
-            color="mediumblue",
-            linewidth=1,
-            label="Kijun",
-        )
-
-        senkou_a = df["SenkouA"].to_numpy(dtype=float)
-        senkou_b = df["SenkouB"].to_numpy(dtype=float)
-
-        valid = np.isfinite(senkou_a) & np.isfinite(senkou_b)
-
-        ax_price.fill_between(
-            df.index,
-            senkou_a,
-            senkou_b,
-            where=valid & (senkou_a >= senkou_b),
-            color="lightcoral",
-            alpha=0.25,
-        )
-        ax_price.fill_between(
-            df.index,
-            senkou_a,
-            senkou_b,
-            where=valid & (senkou_a < senkou_b),
-            color="lightgreen",
-            alpha=0.25,
-        )
-
-    structure = detect_market_structure(df)
-
-    if structure["available"]:
-        neckline = structure["neckline"]
-
-        ax_price.axhline(
-            neckline,
-            color="#d32f2f",
-            linestyle="--",
-            linewidth=1,
-            alpha=0.7,
-            label="Neckline",
-        )
-
-    ax_price.set_title(
-        f"{ticker} - Technical Dashboard",
-        fontsize=12,
-    )
-    ax_price.legend(
-        loc="upper left",
-        fontsize="small",
-        ncol=3,
-    )
-    ax_price.grid(True, alpha=0.25)
-
-    # 出来高
-    volume_colors = np.where(
-        df["Close"] >= df["Open"],
-        "#ef5350",
-        "#26a69a",
-    )
-
-    ax_volume.bar(
-        df.index,
-        df["Volume"],
-        color=volume_colors,
-        alpha=0.65,
-    )
-    ax_volume.plot(
-        df.index,
-        df["Vol_MA20"],
-        color="navy",
-        linewidth=1,
-        label="Volume MA20",
-    )
-    ax_volume.set_ylabel("Volume")
-    ax_volume.legend(loc="upper left", fontsize="small")
-    ax_volume.grid(True, alpha=0.25)
-
-    # MACD
-    histogram_colors = np.where(
-        df["MACD_Hist"] >= 0,
-        "#ef5350",
-        "#26a69a",
-    )
-
-    ax_macd.plot(
-        df.index,
-        df["MACD"],
-        label="MACD",
-        color="blue",
-    )
-    ax_macd.plot(
-        df.index,
-        df["Signal"],
-        label="Signal",
-        color="orange",
-    )
-    ax_macd.bar(
-        df.index,
-        df["MACD_Hist"],
-        color=histogram_colors,
-        alpha=0.4,
-    )
-    ax_macd.axhline(0, color="gray", linewidth=0.7)
-    ax_macd.set_ylabel("MACD")
-    ax_macd.legend(loc="upper left", fontsize="small")
-    ax_macd.grid(True, alpha=0.25)
-
-    # RSI
-    ax_rsi.plot(
-        df.index,
-        df["RSI_9"],
-        label="RSI(9)",
-        color="magenta",
-    )
-    ax_rsi.plot(
-        df.index,
-        df["RSI_14"],
-        label="RSI(14)",
-        color="deepskyblue",
-    )
-    ax_rsi.axhline(70, color="red", linestyle=":", alpha=0.7)
-    ax_rsi.axhline(30, color="blue", linestyle=":", alpha=0.7)
-    ax_rsi.set_ylim(0, 100)
-    ax_rsi.set_ylabel("RSI")
-    ax_rsi.legend(loc="upper left", fontsize="small")
-    ax_rsi.grid(True, alpha=0.25)
-
-    # KDJ
-    ax_kdj.plot(df.index, df["K"], label="K", color="blue")
-    ax_kdj.plot(df.index, df["D"], label="D", color="orange")
-    ax_kdj.plot(df.index, df["J"], label="J", color="green")
-    ax_kdj.axhline(80, color="red", linestyle=":", alpha=0.5)
-    ax_kdj.axhline(20, color="blue", linestyle=":", alpha=0.5)
-    ax_kdj.set_ylabel("KDJ")
-    ax_kdj.legend(loc="upper left", fontsize="small")
-    ax_kdj.grid(True, alpha=0.25)
-
-    fig.autofmt_xdate()
-    plt.tight_layout()
-
-    return fig
-
-
-def category_metric(
-    container,
-    category_name: str,
-    category_data: dict,
-):
-    normalized = category_data["normalized"]
-    earned = category_data["earned"]
-    available = category_data["available"]
-
-    if normalized is None:
-        container.metric(category_name, "判定不能")
-    else:
-        container.metric(
-            category_name,
-            f"{normalized}%",
-            help=f"取得できた項目での得点: {earned}/{available}",
-        )
-
-
-# =========================================================
-# セッション状態
-# =========================================================
-if "is_analyzed" not in st.session_state:
-    st.session_state.is_analyzed = False
-
-if "last_ticker" not in st.session_state:
-    st.session_state.last_ticker = ""
-
-if "last_company" not in st.session_state:
-    st.session_state.last_company = ""
-
-
-# =========================================================
-# ヘッダー
-# =========================================================
-st.title("📈 株価テクニカル＆ファンダメンタル分析")
-st.caption(
-    "企業品質・市場環境・売られ過ぎ・反転確認を分離して判定します。"
-    "売買を保証するものではなく、取得データに基づく参考情報です。"
-)
-
-
-# =========================================================
-# 銘柄選択
-# =========================================================
-sheet_options, sheet_error = load_sheet_options(SHEET_LINK)
-
-if sheet_error:
-    st.warning(
-        "Googleスプレッドシートの銘柄一覧を取得できなかったため、"
-        "標準リストを使用します。"
-    )
-
-all_options = list(
-    dict.fromkeys(BASE_OPTIONS + sheet_options)
-)
-all_options.append("その他（手入力）")
-
-col1, col2, col3, col4 = st.columns(4)
-
-with col1:
-    ticker_choice = st.selectbox(
-        "銘柄選択",
-        all_options,
-    )
-
-    company_name = ""
-
-    if ticker_choice == "その他（手入力）":
-        ticker_symbol = st.text_input(
-            "銘柄コード",
-            value="7203.T",
-            help="例：NVDA、AAPL、7203.T",
-        ).strip().upper()
-    else:
-        ticker_symbol = ticker_choice.split(" ")[0].upper()
-
-        if "(" in ticker_choice and ")" in ticker_choice:
-            company_name = (
-                ticker_choice.split("(", 1)[1]
-                .rsplit(")", 1)[0]
-                .strip()
-            )
-
-with col2:
-    display_period = st.selectbox(
-        "グラフ表示期間",
-        ["3ヶ月", "6ヶ月", "1年", "5年"],
-        index=1,
-    )
-
-with col3:
-    chart_mode = st.radio(
-        "表示形式",
-        ["ローソク足", "ラインチャート"],
-        horizontal=False,
-    )
-
-with col4:
-    ichimoku_mode = st.radio(
-        "一目均衡表",
-        ["表示しない", "表示する"],
-        horizontal=False,
-    )
-
-button_col1, button_col2 = st.columns([3, 1])
-
-with button_col1:
-    run_button = st.button(
-        "分析を実行する",
-        type="primary",
-        use_container_width=True,
-    )
-
-with button_col2:
-    if st.button(
-        "キャッシュ更新",
-        use_container_width=True,
-        help="データ取得キャッシュを削除します。",
+    if (
+        frame["BollingerUpper"].notna().any()
+        and frame["BollingerLower"].notna().any()
     ):
-        st.cache_data.clear()
-        st.success("キャッシュを削除しました。")
+        upper = frame["BollingerUpper"].astype(float).to_numpy()
+        lower = frame["BollingerLower"].astype(float).to_numpy()
+
+        price_axis.fill_between(
+            frame.index,
+            lower,
+            upper,
+            color="#90CAF9",
+            alpha=0.16,
+            label="Bollinger Band",
+        )
+
+    if result.support is not None:
+        price_axis.axhline(
+            result.support,
+            color="#2E7D32",
+            linestyle="--",
+            linewidth=0.9,
+            alpha=0.8,
+            label="Support",
+        )
+
+    if result.resistance is not None:
+        price_axis.axhline(
+            result.resistance,
+            color="#C62828",
+            linestyle="--",
+            linewidth=0.9,
+            alpha=0.8,
+            label="Resistance",
+        )
+
+    price_axis.set_ylabel("Price")
+    price_axis.grid(alpha=0.18)
+    price_axis.legend(
+        loc="upper left",
+        ncol=3,
+        fontsize=8,
+    )
+
+    colors = np.where(
+        frame["Close"].diff().fillna(0) >= 0,
+        "#26A69A",
+        "#EF5350",
+    )
+
+    volume_axis.bar(
+        frame.index,
+        frame["Volume"],
+        color=colors,
+        width=1.0,
+        alpha=0.75,
+    )
+
+    volume_axis.plot(
+        frame.index,
+        frame["VolumeSMA20"],
+        color="#455A64",
+        linewidth=1.0,
+    )
+
+    volume_axis.set_ylabel("Volume")
+    volume_axis.grid(alpha=0.15)
+
+    macd_axis.plot(
+        frame.index,
+        frame["MACD"],
+        color="#1565C0",
+        linewidth=1.1,
+        label="MACD",
+    )
+
+    macd_axis.plot(
+        frame.index,
+        frame["MACDSignal"],
+        color="#FB8C00",
+        linewidth=1.0,
+        label="Signal",
+    )
+
+    histogram_colors = np.where(
+        frame["MACDHistogram"].fillna(0) >= 0,
+        "#26A69A",
+        "#EF5350",
+    )
+
+    macd_axis.bar(
+        frame.index,
+        frame["MACDHistogram"],
+        color=histogram_colors,
+        width=1.0,
+        alpha=0.55,
+    )
+
+    macd_axis.axhline(
+        0,
+        color="#777777",
+        linewidth=0.7,
+    )
+
+    macd_axis.set_ylabel("MACD")
+    macd_axis.grid(alpha=0.15)
+    macd_axis.legend(
+        loc="upper left",
+        fontsize=8,
+    )
+
+    figure.autofmt_xdate()
+    return figure
 
 
-if run_button:
-    if not ticker_symbol:
-        st.warning("銘柄コードを入力してください。")
-    else:
-        st.session_state.is_analyzed = True
-        st.session_state.last_ticker = ticker_symbol
-        st.session_state.last_company = company_name
+def render_fundamentals(info: dict[str, Any]) -> None:
+    rows = [
+        ("企業名", info.get("longName") or info.get("shortName")),
+        ("セクター", info.get("sector")),
+        ("業種", info.get("industry")),
+        ("時価総額", format_large_number(info.get("marketCap"))),
+        ("PER", format_number(info.get("trailingPE"))),
+        ("予想PER", format_number(info.get("forwardPE"))),
+        ("PBR", format_number(info.get("priceToBook"))),
+        ("ROE", percent_from_ratio(info.get("returnOnEquity"))),
+        (
+            "営業利益率",
+            percent_from_ratio(info.get("operatingMargins")),
+        ),
+        (
+            "売上高成長率",
+            percent_from_ratio(info.get("revenueGrowth")),
+        ),
+        (
+            "利益成長率",
+            percent_from_ratio(info.get("earningsGrowth")),
+        ),
+        (
+            "負債資本比率",
+            format_number(info.get("debtToEquity")),
+        ),
+        (
+            "配当利回り",
+            percent_from_ratio(info.get("dividendYield")),
+        ),
+        (
+            "ベータ",
+            format_number(info.get("beta")),
+        ),
+        (
+            "52週高値",
+            format_number(info.get("fiftyTwoWeekHigh")),
+        ),
+        (
+            "52週安値",
+            format_number(info.get("fiftyTwoWeekLow")),
+        ),
+    ]
+
+    table = pd.DataFrame(
+        rows,
+        columns=["項目", "値"],
+    )
+
+    table["値"] = table["値"].fillna("－")
+
+    st.dataframe(
+        table,
+        use_container_width=True,
+        hide_index=True,
+    )
 
 
-# =========================================================
-# 分析画面
-# =========================================================
-if st.session_state.is_analyzed:
-    ticker_to_analyze = st.session_state.last_ticker
-    company_to_analyze = st.session_state.last_company
+def render_score(result: AnalysisResult) -> None:
+    st.subheader("総合スコア")
+
+    score_column, judgment_column = st.columns([1, 2])
+
+    with score_column:
+        st.metric(
+            "スコア",
+            f"{result.score:.1f} / 100",
+        )
+
+        st.progress(
+            min(max(result.score / 100, 0.0), 1.0)
+        )
+
+    with judgment_column:
+        st.markdown(
+            f"""
+            <div class="result-card">
+                <div style="font-size:0.9rem;color:#777;">
+                    総合判定
+                </div>
+                <div style="font-size:1.8rem;font-weight:700;">
+                    {result.verdict}
+                </div>
+                <div class="small-note">
+                    テクニカル、出来高、相対強度、
+                    ファンダメンタルズを点数化した参考評価です。
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    st.markdown("#### スコア内訳")
+
+    for component, score in result.components.items():
+        maximum = result.component_maximums[component]
+        ratio = score / maximum if maximum else 0
+
+        label_column, progress_column, value_column = st.columns(
+            [1.3, 4, 1]
+        )
+
+        label_column.write(component)
+
+        progress_column.progress(
+            min(max(ratio, 0.0), 1.0)
+        )
+
+        value_column.write(
+            f"{score:.1f} / {maximum:.0f}"
+        )
+
+
+def main() -> None:
+    st.title("📈 株式分析ダッシュボード")
+
+    st.caption(
+        "日足価格、テクニカル指標、出来高、"
+        "市場・セクター相対強度、企業情報を統合して分析します。"
+    )
+
+    with st.sidebar:
+        st.header("分析条件")
+
+        provider_name = st.selectbox(
+            "データ取得元",
+            options=["yfinance"],
+            index=0,
+        )
+
+        default_symbol = st.session_state.get(
+            "last_symbol",
+            "NVDA",
+        )
+
+        symbol_input = st.text_input(
+            "銘柄コード",
+            value=default_symbol,
+            help=(
+                "米国株は NVDA、日本株は 7203.T "
+                "のように入力してください。"
+            ),
+        )
+
+        analyze_button = st.button(
+            "分析を実行",
+            type="primary",
+            use_container_width=True,
+        )
+
+        if st.button(
+            "キャッシュを削除",
+            use_container_width=True,
+        ):
+            st.cache_data.clear()
+            st.success("キャッシュを削除しました。")
+
+        st.divider()
+
+        st.markdown(
+            """
+            **入力例**
+
+            - 米国株：`NVDA`
+            - 米国ETF：`SPY`
+            - 日本株：`7203.T`
+            - 日本指数：`^N225`
+            """
+        )
+
+    if not analyze_button and "analysis_symbol" not in st.session_state:
+        st.info(
+            "左側のサイドバーで銘柄コードを入力し、"
+            "「分析を実行」を押してください。"
+        )
+        return
+
+    if analyze_button:
+        try:
+            normalized_symbol = normalize_symbol(symbol_input)
+            st.session_state["analysis_symbol"] = normalized_symbol
+            st.session_state["last_symbol"] = normalized_symbol
+        except ValueError as exc:
+            st.error(str(exc))
+            return
+
+    symbol = st.session_state.get(
+        "analysis_symbol",
+        normalize_symbol(symbol_input),
+    )
 
     try:
         with st.spinner(
-            f"{ticker_to_analyze}のデータを取得・分析しています..."
+            f"{symbol}の価格・企業情報を取得しています..."
         ):
-            bundle = get_cached_bundle(
-                provider_name="yfinance",
-                symbol=ticker_to_analyze,
+            bundle = cached_load_market_bundle(
+                provider_name=provider_name,
+                symbol=symbol,
             )
-
     except Exception as exc:
-        st.error(f"データ取得に失敗しました: {exc}")
-        st.stop()
-
-    primary = bundle.primary
-    raw_df = primary.prices.copy()
-    info = primary.info or {}
-
-    if raw_df.empty or len(raw_df) < 80:
         st.error(
-            f"銘柄「{ticker_to_analyze}」の有効な日足が不足しています。"
-            "銘柄コードまたは上場市場を確認してください。"
+            "データ取得に失敗しました。銘柄コードと"
+            "インターネット接続を確認してください。"
         )
-        st.stop()
+        st.exception(exc)
+        return
 
-    df = add_indicators(raw_df)
-    df = detect_candlestick_patterns(df)
+    if bundle.primary.prices.empty:
+        st.error(
+            f"{symbol}の有効な価格データを取得できませんでした。"
+        )
 
-    market_df = None
-    if bundle.market is not None and not bundle.market.prices.empty:
-        market_df = bundle.market.prices
+        for warning in bundle.warnings:
+            st.warning(warning)
 
-    sector_df = None
-    if bundle.sector is not None and not bundle.sector.prices.empty:
-        sector_df = bundle.sector.prices
+        return
 
-    score_result = calculate_score(
-        df=df,
-        info=info,
-        market_df=market_df,
-        sector_df=sector_df,
-        market_label=bundle.market_symbol or "市場",
-        sector_label=bundle.sector_symbol or "セクター",
-    )
+    try:
+        result = analyze_stock(
+            symbol=bundle.primary.symbol,
+            prices=bundle.primary.prices,
+            info=bundle.primary.info,
+            market_prices=(
+                bundle.market.prices
+                if bundle.market is not None
+                else None
+            ),
+            sector_prices=(
+                bundle.sector.prices
+                if bundle.sector is not None
+                else None
+            ),
+        )
+    except Exception as exc:
+        st.error("分析処理に失敗しました。")
+        st.exception(exc)
+        return
 
-    latest = df.iloc[-1]
-    previous = df.iloc[-2]
-
-    currency_symbol, currency_code = get_currency_symbol(
-        info,
-        primary.metadata,
-        ticker_to_analyze,
-    )
-
-    company_display = (
-        company_to_analyze
-        or info.get("longName")
+    info = bundle.primary.info
+    company_name = (
+        info.get("longName")
         or info.get("shortName")
-        or ticker_to_analyze
+        or bundle.primary.symbol
     )
 
-    st.markdown("---")
-    st.subheader(
-        f"🏢 {company_display}【{ticker_to_analyze}】"
-    )
+    st.subheader(f"{company_name}（{bundle.primary.symbol}）")
 
-    # データ状態
-    data_col1, data_col2, data_col3, data_col4 = st.columns(4)
+    latest = result.latest
+    close = latest.get("close")
+    change = latest.get("change")
+    change_percent = latest.get("change_percent")
 
-    last_date = pd.Timestamp(df.index[-1]).strftime("%Y-%m-%d")
-    timezone_name = (
-        primary.metadata.get("exchangeTimezoneName")
-        or primary.metadata.get("timezone")
-        or "不明"
-    )
+    delta_text = None
 
-    data_col1.metric("データソース", primary.source)
-    data_col2.metric("最終確定日足", last_date)
-    data_col3.metric("市場タイムゾーン", timezone_name)
-    data_col4.metric(
-        "データ完全性",
-        f"{score_result.completeness}%",
-    )
-
-    if primary.dropped_incomplete_bar:
-        st.info(
-            "当日の日足が未確定だったため、正式な分析対象から除外しました。"
-            "グラフとスコアは直近の確定日足までを使用しています。"
+    if change is not None and change_percent is not None:
+        delta_text = (
+            f"{change:+,.2f} "
+            f"({change_percent:+.2f}%)"
         )
 
-    if bundle.warnings:
-        with st.expander("データ取得に関する注意事項"):
-            for warning in dict.fromkeys(bundle.warnings):
-                st.write(f"・{warning}")
+    columns = st.columns(6)
 
-    if score_result.completeness < 80:
-        st.warning(
-            "一部データが取得できていません。"
-            "総合スコアは取得できた項目だけで正規化されています。"
-        )
-
-    # 基本情報
-    price_change = latest["Close"] - previous["Close"]
-    price_change_percent = (
-        price_change / previous["Close"] * 100
-        if previous["Close"] != 0
-        else 0
+    columns[0].metric(
+        "終値",
+        format_number(close),
+        delta=delta_text,
     )
 
-    pe = safe_number(info.get("trailingPE"))
-    pbr = safe_number(info.get("priceToBook"))
-    dividend_yield = (
-        info.get("dividendYield")
-        if info.get("dividendYield") is not None
-        else info.get("trailingAnnualDividendYield")
+    columns[1].metric(
+        "RSI（14）",
+        format_number(latest.get("rsi14"), 1),
     )
 
-    info_col1, info_col2, info_col3, info_col4 = st.columns(4)
-
-    info_col1.metric(
-        f"株価（{currency_code}）",
-        f"{currency_symbol}{latest['Close']:,.2f}",
-        delta=f"{price_change_percent:+.2f}%",
-    )
-    info_col2.metric(
-        "PER",
-        format_value(pe, 1, "倍"),
-    )
-    info_col3.metric(
-        "配当利回り",
-        format_dividend_yield(dividend_yield),
-    )
-    info_col4.metric(
-        "PBR",
-        format_value(pbr, 2, "倍"),
-    )
-
-    with st.expander("企業情報をさらに表示"):
-        detail_col1, detail_col2, detail_col3 = st.columns(3)
-
-        detail_col1.write(f"**業種:** {info.get('industry', '取得不可')}")
-        detail_col1.write(f"**セクター:** {info.get('sector', '取得不可')}")
-        detail_col2.write(f"**時価総額:** {format_large_number(info.get('marketCap'))}")
-
-        # 💡 ここが先ほどのエラー原因（文法エラーを修正しました）
-        rev_growth_raw = safe_number(info.get('revenueGrowth'))
-        rev_growth_val = rev_growth_raw * 100 if rev_growth_raw is not None else None
-        detail_col2.write(f"**売上成長率:** {format_value(rev_growth_val, 1, '%')}")
-
-        op_margin_raw = safe_number(info.get('operatingMargins'))
-        op_margin_val = op_margin_raw * 100 if op_margin_raw is not None else None
-        detail_col3.write(f"**営業利益率:** {format_value(op_margin_val, 1, '%')}")
-
-        f_pe = safe_number(info.get('forwardPE'))
-        detail_col3.write(f"**予想PER:** {format_value(f_pe, 1, '倍')}")
-
-    st.markdown("---")
-
-    # グラフ
-    st.subheader("📊 テクニカルチャート")
-
-    chart_df = prepare_chart_data(
-        df,
-        display_period,
-    )
-
-    fig = draw_chart(
-        chart_df,
-        ticker=ticker_to_analyze,
-        chart_mode=chart_mode,
-        show_ichimoku=(ichimoku_mode == "表示する"),
-    )
-
-    st.pyplot(fig, use_container_width=True)
-    plt.close(fig)
-
-    # 現在のテクニカル値
-    technical_col1, technical_col2, technical_col3, technical_col4 = (
-        st.columns(4)
-    )
-
-    technical_col1.metric(
-        "RSI(14)",
-        format_value(latest["RSI_14"], 1),
-    )
-    technical_col2.metric(
+    columns[2].metric(
         "MACD",
-        format_value(latest["MACD"], 3),
-    )
-    technical_col3.metric(
-        "出来高 / 20日平均",
-        (
-            f"{latest['Volume'] / latest['Vol_MA20']:.2f}倍"
-            if latest["Vol_MA20"] > 0
-            else "計算不可"
-        ),
-    )
-    technical_col4.metric(
-        "ATR(14)",
-        format_value(latest["ATR14"], 2),
+        format_number(latest.get("macd"), 3),
     )
 
-    # スコア
-    st.markdown("---")
-    st.subheader("🎯 総合判定")
-
-    overall_col1, overall_col2 = st.columns([1, 2])
-
-    with overall_col1:
-        score_text = (
-            f"{score_result.normalized_score}点"
-            if score_result.normalized_score is not None
-            else "判定不能"
-        )
-
-        st.markdown(
-            f"""
-            <div style="
-                text-align:center;
-                border:1px solid #dddddd;
-                border-radius:12px;
-                padding:22px;
-            ">
-                <div style="font-size:16px;">参考総合スコア</div>
-                <div style="
-                    font-size:42px;
-                    font-weight:bold;
-                    color:{score_result.status_color};
-                ">
-                    {score_text}
-                </div>
-                <div style="font-size:13px;">
-                    取得項目 {score_result.earned}/{score_result.available}
-                </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-    with overall_col2:
-        safe_status = html.escape(score_result.status)
-
-        st.markdown(
-            f"""
-            <div style="
-                text-align:center;
-                color:{score_result.status_color};
-                font-size:24px;
-                font-weight:bold;
-                margin-top:25px;
-            ">
-                {safe_status}
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-        st.caption(
-            "総合スコアは売買指示ではありません。"
-            "企業品質・市場環境・売られ過ぎ・反転確認の"
-            "取得可能な項目を100点換算した参考値です。"
-        )
-
-    category_col1, category_col2, category_col3, category_col4 = (
-        st.columns(4)
+    columns[3].metric(
+        "ATR（14）",
+        format_number(latest.get("atr14")),
     )
 
-    category_metric(
-        category_col1,
-        "企業品質",
-        score_result.category_scores["企業品質"],
-    )
-    category_metric(
-        category_col2,
-        "市場環境",
-        score_result.category_scores["市場環境"],
-    )
-    category_metric(
-        category_col3,
-        "売られ過ぎ",
-        score_result.category_scores["売られ過ぎ"],
-    )
-    category_metric(
-        category_col4,
-        "反転確認",
-        score_result.category_scores["反転確認"],
+    columns[4].metric(
+        "サポート参考値",
+        format_number(result.support),
     )
 
-    # リスク自己点検
-    st.markdown("---")
-    st.subheader("📝 リスク・自己点検")
-
-    risk_score = st.slider(
-        "資金管理・リスクリワードの自己評価",
-        min_value=0,
-        max_value=5,
-        value=2,
-        help=(
-            "この値は総合分析スコアには加算しません。"
-            "損切り位置、投資額、セクター偏重を自己確認するための項目です。"
-        ),
+    columns[5].metric(
+        "レジスタンス参考値",
+        format_number(result.resistance),
     )
 
-    atr = safe_number(latest["ATR14"])
+    if bundle.warnings or result.warnings:
+        with st.expander(
+            "データ・分析上の注意事項",
+            expanded=False,
+        ):
+            for warning in dict.fromkeys(
+                bundle.warnings + result.warnings
+            ):
+                st.warning(warning)
 
-    if atr is not None:
-        stop_reference = latest["Close"] - atr * 2
-        risk_per_share = latest["Close"] - stop_reference
-        target_2r = latest["Close"] + risk_per_share * 2
-
-        risk_col1, risk_col2, risk_col3 = st.columns(3)
-
-        risk_col1.metric(
-            "参考2ATRストップ",
-            f"{currency_symbol}{stop_reference:,.2f}",
-        )
-        risk_col2.metric(
-            "1株あたり参考リスク",
-            f"{currency_symbol}{risk_per_share:,.2f}",
-        )
-        risk_col3.metric(
-            "参考2R到達価格",
-            f"{currency_symbol}{target_2r:,.2f}",
-        )
-
-        st.caption(
-            "ATRによる価格は機械的な参考値です。"
-            "窓開け、決算、流動性、為替、手数料は考慮していません。"
-        )
-
-    st.write(f"自己点検結果：**{risk_score} / 5点**")
-
-    # 詳細採点
-    with st.expander(
-        "詳細な自動判定の内訳を見る",
-        expanded=False,
-    ):
-        for category in [
-            "企業品質",
-            "市場環境",
-            "売られ過ぎ",
-            "反転確認",
-        ]:
-            category_data = score_result.category_scores[category]
-
-            st.markdown(
-                f"### {category} "
-                f"（{category_data['earned']}/"
-                f"{category_data['available']}点）"
-            )
-
-            category_items = [
-                item
-                for item in score_result.items
-                if item.category == category
+    tab_summary, tab_chart, tab_signals, tab_fundamentals, tab_data = (
+        st.tabs(
+            [
+                "総合評価",
+                "チャート",
+                "シグナル",
+                "企業情報",
+                "分析データ",
             ]
-
-            rows = []
-
-            for item in category_items:
-                if not item.available:
-                    result_text = "判定不能"
-                elif item.passed:
-                    result_text = "✅ 成立"
-                else:
-                    result_text = "－ 不成立"
-
-                rows.append(
-                    {
-                        "判定項目": item.label,
-                        "結果": result_text,
-                        "得点": (
-                            f"{item.earned}/{item.points}"
-                            if item.available
-                            else f"-/{item.points}"
-                        ),
-                        "詳細": item.detail,
-                    }
-                )
-
-            st.dataframe(
-                pd.DataFrame(rows),
-                use_container_width=True,
-                hide_index=True,
-            )
-
-    # 反転構造
-    with st.expander(
-        "安値切り上げ・ネックライン判定を見る",
-        expanded=False,
-    ):
-        structure = detect_market_structure(df)
-
-        if not structure["available"]:
-            st.info(
-                "直近120営業日以内に、比較可能な確定スイング安値が"
-                "2つ見つからなかったため判定できません。"
-            )
-        else:
-            structure_col1, structure_col2, structure_col3 = st.columns(3)
-
-            structure_col1.metric(
-                "第1スイング安値",
-                f"{currency_symbol}{structure['first_low']:,.2f}",
-            )
-            structure_col2.metric(
-                "第2スイング安値",
-                f"{currency_symbol}{structure['second_low']:,.2f}",
-            )
-            structure_col3.metric(
-                "ネックライン",
-                f"{currency_symbol}{structure['neckline']:,.2f}",
-            )
-
-            st.write(
-                "安値切り上げ：",
-                "✅ 確認" if structure["recent_higher_low"] else "未確認",
-            )
-            st.write(
-                "ネックライン突破：",
-                "✅ 確認" if structure["neckline_breakout"] else "未確認",
-            )
-
-            st.caption(
-                "スイング安値は左右2日間の価格を確認してから確定します。"
-                "そのため、直近2本の日足はスイング安値として扱いません。"
-            )
-
-    st.markdown("---")
-    st.caption(
-        "免責事項：本アプリは情報提供・学習目的です。"
-        "投資判断は利用者自身の責任で行ってください。"
-        "yfinanceのデータには遅延、欠損、修正が発生する場合があります。"
+        )
     )
+
+    with tab_summary:
+        render_score(result)
+
+        st.divider()
+        st.markdown("#### 相対パフォーマンス")
+
+        relative_columns = st.columns(3)
+
+        relative_columns[0].metric(
+            "銘柄の約3か月リターン",
+            format_number(
+                latest.get("primary_return_3m"),
+                1,
+                "%",
+            ),
+        )
+
+        relative_columns[1].metric(
+            f"市場比（{bundle.market_symbol or 'なし'}）",
+            format_number(
+                result.market_relative_return,
+                1,
+                "pt",
+            ),
+        )
+
+        relative_columns[2].metric(
+            f"セクター比（{bundle.sector_symbol or 'なし'}）",
+            format_number(
+                result.sector_relative_return,
+                1,
+                "pt",
+            ),
+        )
+
+        st.caption(
+            "相対値は銘柄リターンから市場または"
+            "セクターのリターンを差し引いた参考値です。"
+        )
+
+    with tab_chart:
+        st.markdown("#### 直近約1年の価格・出来高・MACD")
+
+        figure = create_chart(result)
+        st.pyplot(figure, use_container_width=True)
+        plt.close(figure)
+
+    with tab_signals:
+        st.markdown("#### テクニカル・評価シグナル")
+
+        if result.signals:
+            for signal in result.signals:
+                st.write(f"・{signal}")
+        else:
+            st.info("表示できるシグナルがありません。")
+
+        st.markdown("#### ローソク足パターン")
+
+        if result.candlestick_patterns:
+            for pattern in result.candlestick_patterns:
+                st.write(f"・{pattern}")
+        else:
+            st.write(
+                "直近足に主要なローソク足パターンは"
+                "検出されませんでした。"
+            )
+
+        st.warning(
+            "パターンは直近の日足のみを対象とした簡易判定です。"
+            "単独で将来の値動きを確定するものではありません。"
+        )
+
+    with tab_fundamentals:
+        st.markdown("#### 企業情報・主要指標")
+
+        if info:
+            render_fundamentals(info)
+        else:
+            st.info(
+                "企業情報を取得できなかったため、"
+                "表示できるファンダメンタルデータがありません。"
+            )
+
+    with tab_data:
+        st.markdown("#### 最新の分析データ")
+
+        display_columns = [
+            "Open",
+            "High",
+            "Low",
+            "Close",
+            "Volume",
+            "SMA20",
+            "SMA50",
+            "SMA200",
+            "RSI14",
+            "MACD",
+            "MACDSignal",
+            "MACDHistogram",
+            "K",
+            "D",
+            "J",
+            "ATR14",
+        ]
+
+        available_columns = [
+            column
+            for column in display_columns
+            if column in result.frame.columns
+        ]
+
+        st.dataframe(
+            result.frame[available_columns]
+            .tail(250)
+            .sort_index(ascending=False),
+            use_container_width=True,
+        )
+
+        csv_data = result.frame.to_csv(
+            index=True
+        ).encode("utf-8-sig")
+
+        st.download_button(
+            "分析データをCSVでダウンロード",
+            data=csv_data,
+            file_name=f"{result.symbol}_analysis.csv",
+            mime="text/csv",
+        )
+
+    st.divider()
+
+    st.caption(
+        "本アプリのスコア、支持線・抵抗線、テクニカルシグナルは"
+        "統計的・機械的な参考情報です。投資成果を保証するものではなく、"
+        "売買判断は価格変動、決算、流動性、為替、ニュースなども含めて"
+        "総合的に検討してください。"
+    )
+
+
+if __name__ == "__main__":
+    main()
