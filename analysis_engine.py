@@ -1,171 +1,90 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Optional
 
 import numpy as np
 import pandas as pd
 
 
 @dataclass
-class ScoreItem:
-    category: str
-    label: str
-    points: int
-    passed: bool
-    available: bool
-    detail: str = ""
-
-    @property
-    def earned(self) -> int:
-        if self.available and self.passed:
-            return self.points
-        return 0
-
-
-@dataclass
-class ScoreResult:
-    items: list[ScoreItem] = field(default_factory=list)
-    earned: int = 0
-    available: int = 0
-    theoretical: int = 100
-    normalized_score: int | None = None
-    completeness: int = 0
-    category_scores: dict[str, dict[str, int | None]] = field(
-        default_factory=dict
-    )
-    status: str = ""
-    status_color: str = "gray"
+class AnalysisResult:
+    symbol: str
+    frame: pd.DataFrame
+    score: float
+    verdict: str
+    components: dict[str, float] = field(default_factory=dict)
+    component_maximums: dict[str, float] = field(default_factory=dict)
+    latest: dict[str, Any] = field(default_factory=dict)
+    signals: list[str] = field(default_factory=list)
+    candlestick_patterns: list[str] = field(default_factory=list)
+    support: Optional[float] = None
+    resistance: Optional[float] = None
+    market_relative_return: Optional[float] = None
+    sector_relative_return: Optional[float] = None
+    warnings: list[str] = field(default_factory=list)
 
 
-def safe_number(value: Any) -> float | None:
-    if value is None:
-        return None
-
+def _safe_float(value: Any) -> Optional[float]:
     try:
-        number = float(value)
+        converted = float(value)
+
+        if np.isfinite(converted):
+            return converted
     except (TypeError, ValueError):
-        return None
+        pass
 
-    if not np.isfinite(number):
-        return None
-
-    return number
+    return None
 
 
-def calculate_rsi_wilder(
+def _latest_value(
     series: pd.Series,
-    period: int = 14,
-) -> pd.Series:
-    """
-    Wilder方式のRSI。
-    一般的なチャートソフトに近い計算方式です。
-    """
-    delta = series.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
+    default: Optional[float] = None,
+) -> Optional[float]:
+    if series is None or series.empty:
+        return default
 
-    avg_gain = gain.ewm(
+    value = _safe_float(series.iloc[-1])
+    return default if value is None else value
+
+
+def _rsi(close: pd.Series, period: int = 14) -> pd.Series:
+    delta = close.diff()
+
+    gains = delta.clip(lower=0)
+    losses = -delta.clip(upper=0)
+
+    average_gain = gains.ewm(
         alpha=1 / period,
         adjust=False,
         min_periods=period,
     ).mean()
 
-    avg_loss = loss.ewm(
+    average_loss = losses.ewm(
         alpha=1 / period,
         adjust=False,
         min_periods=period,
     ).mean()
 
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    rsi = 100 - (100 / (1 + rs))
+    relative_strength = average_gain / average_loss.replace(0, np.nan)
+    rsi = 100 - (100 / (1 + relative_strength))
 
-    # 上昇だけが続いた場合
-    rsi = rsi.mask((avg_loss == 0) & (avg_gain > 0), 100)
+    # 下落がなく平均損失がゼロの場合
+    rsi = rsi.mask(
+        (average_loss == 0) & (average_gain > 0),
+        100,
+    )
 
-    # 値動きが全くない場合
-    rsi = rsi.mask((avg_loss == 0) & (avg_gain == 0), 50)
+    # 値動きがない場合
+    rsi = rsi.mask(
+        (average_loss == 0) & (average_gain == 0),
+        50,
+    )
 
     return rsi
 
 
-def add_indicators(source_df: pd.DataFrame) -> pd.DataFrame:
-    df = source_df.copy()
-
-    # 移動平均・ボリンジャーバンド
-    df["MA5"] = df["Close"].rolling(5).mean()
-    df["MA20"] = df["Close"].rolling(20).mean()
-    df["MA50"] = df["Close"].rolling(50).mean()
-
-    df["STD20"] = df["Close"].rolling(20).std(ddof=0)
-    df["Upper"] = df["MA20"] + 2 * df["STD20"]
-    df["Lower"] = df["MA20"] - 2 * df["STD20"]
-
-    df["Vol_MA20"] = df["Volume"].rolling(20).mean()
-
-    # 一目均衡表
-    high9 = df["High"].rolling(9).max()
-    low9 = df["Low"].rolling(9).min()
-    df["Tenkan"] = (high9 + low9) / 2
-
-    high26 = df["High"].rolling(26).max()
-    low26 = df["Low"].rolling(26).min()
-    df["Kijun"] = (high26 + low26) / 2
-
-    df["SenkouA"] = ((df["Tenkan"] + df["Kijun"]) / 2).shift(26)
-
-    high52 = df["High"].rolling(52).max()
-    low52 = df["Low"].rolling(52).min()
-    df["SenkouB"] = ((high52 + low52) / 2).shift(26)
-
-    # MACD
-    ema12 = df["Close"].ewm(span=12, adjust=False).mean()
-    ema26 = df["Close"].ewm(span=26, adjust=False).mean()
-
-    df["MACD"] = ema12 - ema26
-    df["Signal"] = df["MACD"].ewm(span=9, adjust=False).mean()
-    df["MACD_Hist"] = df["MACD"] - df["Signal"]
-
-    # Wilder RSI
-    df["RSI_9"] = calculate_rsi_wilder(df["Close"], 9)
-    df["RSI_14"] = calculate_rsi_wilder(df["Close"], 14)
-
-    # KDJ
-    low_nine = df["Low"].rolling(9).min()
-    high_nine = df["High"].rolling(9).max()
-    denominator = (high_nine - low_nine).replace(0, np.nan)
-    rsv = ((df["Close"] - low_nine) / denominator) * 100
-
-    k_values = np.full(len(df), 50.0)
-    d_values = np.full(len(df), 50.0)
-
-    for i in range(1, len(df)):
-        current_rsv = rsv.iloc[i]
-
-        if pd.isna(current_rsv):
-            k_values[i] = k_values[i - 1]
-            d_values[i] = d_values[i - 1]
-        else:
-            k_values[i] = (
-                (2 / 3) * k_values[i - 1]
-                + (1 / 3) * current_rsv
-            )
-            d_values[i] = (
-                (2 / 3) * d_values[i - 1]
-                + (1 / 3) * k_values[i]
-            )
-
-    df["K"] = k_values
-    df["D"] = d_values
-    df["J"] = 3 * df["K"] - 2 * df["D"]
-
-    # OBV
-    direction = np.sign(df["Close"].diff()).fillna(0)
-    df["OBV"] = (df["Volume"] * direction).cumsum()
-    df["OBV_MA5"] = df["OBV"].rolling(5).mean()
-    df["OBV_MA20"] = df["OBV"].rolling(20).mean()
-
-    # ATR
+def _atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     previous_close = df["Close"].shift(1)
 
     true_range = pd.concat(
@@ -177,605 +96,613 @@ def add_indicators(source_df: pd.DataFrame) -> pd.DataFrame:
         axis=1,
     ).max(axis=1)
 
-    df["ATR14"] = true_range.ewm(
-        alpha=1 / 14,
+    return true_range.ewm(
+        alpha=1 / period,
         adjust=False,
-        min_periods=14,
+        min_periods=period,
     ).mean()
+
+
+def _obv(df: pd.DataFrame) -> pd.Series:
+    direction = np.sign(df["Close"].diff()).fillna(0)
+    return (direction * df["Volume"]).cumsum()
+
+
+def calculate_indicators(prices: pd.DataFrame) -> pd.DataFrame:
+    if prices is None or prices.empty:
+        return pd.DataFrame()
+
+    df = prices.copy()
+
+    required = ["Open", "High", "Low", "Close", "Volume"]
+
+    missing = [
+        column for column in required
+        if column not in df.columns
+    ]
+
+    if missing:
+        raise ValueError(
+            "価格データに必要な列がありません: "
+            + ", ".join(missing)
+        )
+
+    for column in required:
+        df[column] = pd.to_numeric(
+            df[column],
+            errors="coerce",
+        )
+
+    df = df.dropna(
+        subset=["Open", "High", "Low", "Close"]
+    ).copy()
+
+    df["Volume"] = df["Volume"].fillna(0)
+    df = df.sort_index()
+
+    df["Return"] = df["Close"].pct_change()
+
+    df["SMA20"] = df["Close"].rolling(20).mean()
+    df["SMA50"] = df["Close"].rolling(50).mean()
+    df["SMA200"] = df["Close"].rolling(200).mean()
+
+    df["EMA12"] = df["Close"].ewm(
+        span=12,
+        adjust=False,
+    ).mean()
+
+    df["EMA26"] = df["Close"].ewm(
+        span=26,
+        adjust=False,
+    ).mean()
+
+    df["MACD"] = df["EMA12"] - df["EMA26"]
+
+    df["MACDSignal"] = df["MACD"].ewm(
+        span=9,
+        adjust=False,
+    ).mean()
+
+    df["MACDHistogram"] = (
+        df["MACD"] - df["MACDSignal"]
+    )
+
+    df["RSI14"] = _rsi(df["Close"], 14)
+    df["ATR14"] = _atr(df, 14)
+
+    lowest_low = df["Low"].rolling(9).min()
+    highest_high = df["High"].rolling(9).max()
+
+    price_range = (
+        highest_high - lowest_low
+    ).replace(0, np.nan)
+
+    df["K"] = (
+        100 * (df["Close"] - lowest_low) / price_range
+    ).ewm(
+        alpha=1 / 3,
+        adjust=False,
+    ).mean()
+
+    df["D"] = df["K"].ewm(
+        alpha=1 / 3,
+        adjust=False,
+    ).mean()
+
+    df["J"] = 3 * df["K"] - 2 * df["D"]
+
+    df["VolumeSMA20"] = df["Volume"].rolling(20).mean()
+    df["OBV"] = _obv(df)
+    df["OBVSMA10"] = df["OBV"].rolling(10).mean()
+
+    rolling_std = df["Close"].rolling(20).std()
+
+    df["BollingerUpper"] = df["SMA20"] + 2 * rolling_std
+    df["BollingerLower"] = df["SMA20"] - 2 * rolling_std
+
+    df["High20"] = df["High"].rolling(20).max()
+    df["Low20"] = df["Low"].rolling(20).min()
 
     return df
 
 
-def detect_candlestick_patterns(df: pd.DataFrame) -> pd.DataFrame:
-    result = df.copy()
+def _period_return(
+    prices: Optional[pd.DataFrame],
+    periods: int = 63,
+) -> Optional[float]:
+    if prices is None or prices.empty:
+        return None
 
-    candle_range = (result["High"] - result["Low"]).replace(0, np.nan)
-    body = (result["Close"] - result["Open"]).abs()
+    if "Close" not in prices.columns:
+        return None
 
-    lower_shadow = (
-        result[["Open", "Close"]].min(axis=1) - result["Low"]
+    close = pd.to_numeric(
+        prices["Close"],
+        errors="coerce",
+    ).dropna()
+
+    if len(close) < 2:
+        return None
+
+    start_position = max(0, len(close) - periods - 1)
+    start_value = _safe_float(close.iloc[start_position])
+    end_value = _safe_float(close.iloc[-1])
+
+    if (
+        start_value is None
+        or end_value is None
+        or start_value == 0
+    ):
+        return None
+
+    return (end_value / start_value - 1) * 100
+
+
+def _detect_candlestick_patterns(
+    df: pd.DataFrame,
+) -> list[str]:
+    patterns: list[str] = []
+
+    if len(df) < 2:
+        return patterns
+
+    current = df.iloc[-1]
+    previous = df.iloc[-2]
+
+    open_price = float(current["Open"])
+    close_price = float(current["Close"])
+    high_price = float(current["High"])
+    low_price = float(current["Low"])
+
+    body = abs(close_price - open_price)
+    total_range = max(high_price - low_price, 1e-12)
+
+    upper_shadow = high_price - max(open_price, close_price)
+    lower_shadow = min(open_price, close_price) - low_price
+
+    if body / total_range <= 0.1:
+        patterns.append("十字線（方向感が拮抗）")
+
+    if (
+        lower_shadow >= body * 2
+        and upper_shadow <= max(body, total_range * 0.1)
+        and close_price >= open_price
+    ):
+        patterns.append("ハンマー型（下値否定の可能性）")
+
+    if (
+        upper_shadow >= body * 2
+        and lower_shadow <= max(body, total_range * 0.1)
+    ):
+        patterns.append("上ヒゲ優勢（上値抵抗の可能性）")
+
+    previous_open = float(previous["Open"])
+    previous_close = float(previous["Close"])
+
+    if (
+        previous_close < previous_open
+        and close_price > open_price
+        and open_price <= previous_close
+        and close_price >= previous_open
+    ):
+        patterns.append("強気包み足")
+
+    if (
+        previous_close > previous_open
+        and close_price < open_price
+        and open_price >= previous_close
+        and close_price <= previous_open
+    ):
+        patterns.append("弱気包み足")
+
+    return patterns
+
+
+def _fundamental_score(
+    info: dict[str, Any],
+) -> tuple[float, list[str]]:
+    """
+    最大20点。欠損項目は中立の2点とします。
+    """
+    score = 0.0
+    notes: list[str] = []
+
+    trailing_pe = _safe_float(info.get("trailingPE"))
+
+    if trailing_pe is None:
+        score += 2
+    elif 0 < trailing_pe <= 25:
+        score += 4
+        notes.append("PERは評価上の許容範囲")
+    elif trailing_pe <= 40:
+        score += 2
+    elif trailing_pe > 0:
+        score += 1
+
+    roe = _safe_float(info.get("returnOnEquity"))
+
+    if roe is None:
+        score += 2
+    elif roe >= 0.15:
+        score += 4
+        notes.append("ROEが15%以上")
+    elif roe >= 0.08:
+        score += 3
+    elif roe > 0:
+        score += 1
+
+    operating_margin = _safe_float(
+        info.get("operatingMargins")
     )
-    upper_shadow = (
-        result["High"] - result[["Open", "Close"]].max(axis=1)
+
+    if operating_margin is None:
+        score += 2
+    elif operating_margin >= 0.15:
+        score += 4
+        notes.append("営業利益率が15%以上")
+    elif operating_margin >= 0.08:
+        score += 3
+    elif operating_margin > 0:
+        score += 1
+
+    debt_to_equity = _safe_float(
+        info.get("debtToEquity")
     )
 
-    result["Hammer"] = (
-        (body / candle_range <= 0.35)
-        & (lower_shadow >= body * 2)
-        & (upper_shadow <= candle_range * 0.25)
-        & (
-            result[["Open", "Close"]].max(axis=1)
-            >= result["Low"] + candle_range * 0.60
+    if debt_to_equity is None:
+        score += 2
+    elif debt_to_equity <= 50:
+        score += 4
+        notes.append("負債資本比率が比較的低い")
+    elif debt_to_equity <= 100:
+        score += 3
+    elif debt_to_equity <= 200:
+        score += 1
+
+    revenue_growth = _safe_float(
+        info.get("revenueGrowth")
+    )
+
+    if revenue_growth is None:
+        score += 2
+    elif revenue_growth >= 0.10:
+        score += 4
+        notes.append("売上高成長率が10%以上")
+    elif revenue_growth > 0:
+        score += 3
+    elif revenue_growth > -0.05:
+        score += 1
+
+    return min(score, 20.0), notes
+
+
+def _verdict(score: float) -> str:
+    if score >= 75:
+        return "強いポジティブ"
+    if score >= 60:
+        return "ポジティブ"
+    if score >= 45:
+        return "中立"
+    if score >= 30:
+        return "慎重"
+    return "弱い"
+
+
+def analyze_stock(
+    symbol: str,
+    prices: pd.DataFrame,
+    info: Optional[dict[str, Any]] = None,
+    market_prices: Optional[pd.DataFrame] = None,
+    sector_prices: Optional[pd.DataFrame] = None,
+) -> AnalysisResult:
+    info = info or {}
+    warnings: list[str] = []
+
+    frame = calculate_indicators(prices)
+
+    if frame.empty:
+        raise ValueError("分析可能な価格データがありません。")
+
+    if len(frame) < 50:
+        warnings.append(
+            "価格履歴が50営業日未満のため、"
+            "中長期指標の信頼性が限定的です。"
         )
+    elif len(frame) < 200:
+        warnings.append(
+            "価格履歴が200営業日未満のため、"
+            "200日移動平均線は未確定です。"
+        )
+
+    latest_row = frame.iloc[-1]
+
+    close = _safe_float(latest_row["Close"]) or 0.0
+    previous_close = (
+        _safe_float(frame["Close"].iloc[-2])
+        if len(frame) >= 2
+        else None
     )
 
-    previous_open = result["Open"].shift(1)
-    previous_close = result["Close"].shift(1)
+    sma20 = _safe_float(latest_row["SMA20"])
+    sma50 = _safe_float(latest_row["SMA50"])
+    sma200 = _safe_float(latest_row["SMA200"])
 
-    result["BullishEngulfing"] = (
-        (previous_close < previous_open)
-        & (result["Close"] > result["Open"])
-        & (result["Open"] <= previous_close)
-        & (result["Close"] >= previous_open)
+    rsi = _safe_float(latest_row["RSI14"])
+    macd = _safe_float(latest_row["MACD"])
+    macd_signal = _safe_float(latest_row["MACDSignal"])
+
+    k_value = _safe_float(latest_row["K"])
+    d_value = _safe_float(latest_row["D"])
+    j_value = _safe_float(latest_row["J"])
+
+    volume = _safe_float(latest_row["Volume"]) or 0.0
+    volume_average = _safe_float(
+        latest_row["VolumeSMA20"]
     )
 
-    return result
+    obv = _safe_float(latest_row["OBV"])
+    obv_average = _safe_float(latest_row["OBVSMA10"])
 
+    # トレンド：最大30点
+    trend_score = 0.0
 
-def detect_market_structure(df: pd.DataFrame) -> dict[str, Any]:
-    """
-    確定済みのスイング安値だけを使って、
-    安値切り上げとネックライン突破を判定します。
+    if sma20 is not None and close > sma20:
+        trend_score += 5
 
-    中央の安値を左右2日と比較するため、
-    直近2本はスイング安値として確定しません。
-    """
-    result: dict[str, Any] = {
-        "available": False,
-        "higher_low": False,
-        "recent_higher_low": False,
-        "neckline_breakout": False,
-        "first_low": None,
-        "second_low": None,
-        "neckline": None,
+    if sma50 is not None and close > sma50:
+        trend_score += 6
+
+    if sma200 is None:
+        trend_score += 4
+    elif close > sma200:
+        trend_score += 8
+
+    if sma20 is not None and sma50 is not None and sma20 > sma50:
+        trend_score += 5
+
+    if sma50 is None or sma200 is None:
+        trend_score += 3
+    elif sma50 > sma200:
+        trend_score += 6
+
+    trend_score = min(trend_score, 30)
+
+    # モメンタム：最大25点
+    momentum_score = 0.0
+
+    if rsi is None:
+        momentum_score += 4
+    elif 45 <= rsi <= 65:
+        momentum_score += 8
+    elif 35 <= rsi <= 75:
+        momentum_score += 5
+    else:
+        momentum_score += 1
+
+    if macd is not None and macd_signal is not None:
+        if macd > macd_signal:
+            momentum_score += 7
+
+        if macd > 0:
+            momentum_score += 4
+    else:
+        momentum_score += 5
+
+    if k_value is not None and d_value is not None:
+        if k_value > d_value:
+            momentum_score += 3
+    else:
+        momentum_score += 1.5
+
+    if j_value is None:
+        momentum_score += 1.5
+    elif 20 <= j_value <= 100:
+        momentum_score += 3
+
+    momentum_score = min(momentum_score, 25)
+
+    # 出来高：最大10点
+    volume_score = 0.0
+
+    latest_return = _safe_float(latest_row["Return"])
+
+    if volume_average is None or volume_average <= 0:
+        volume_score += 5
+    else:
+        volume_ratio = volume / volume_average
+
+        if volume_ratio >= 1.2 and (latest_return or 0) > 0:
+            volume_score += 6
+        elif volume_ratio >= 0.7:
+            volume_score += 3
+        else:
+            volume_score += 1
+
+    if obv is None or obv_average is None:
+        volume_score += 2
+    elif obv > obv_average:
+        volume_score += 4
+
+    volume_score = min(volume_score, 10)
+
+    # 相対強度：最大15点
+    primary_return = _period_return(frame, 63)
+    market_return = _period_return(market_prices, 63)
+    sector_return = _period_return(sector_prices, 63)
+
+    market_relative_return: Optional[float] = None
+    sector_relative_return: Optional[float] = None
+
+    relative_score = 0.0
+
+    if primary_return is None:
+        relative_score += 7.5
+    else:
+        if market_return is None:
+            relative_score += 4
+        else:
+            market_relative_return = primary_return - market_return
+
+            if market_relative_return >= 5:
+                relative_score += 8
+            elif market_relative_return >= 0:
+                relative_score += 6
+            elif market_relative_return >= -5:
+                relative_score += 3
+            else:
+                relative_score += 1
+
+        if sector_return is None:
+            relative_score += 3.5
+        else:
+            sector_relative_return = primary_return - sector_return
+
+            if sector_relative_return >= 5:
+                relative_score += 7
+            elif sector_relative_return >= 0:
+                relative_score += 5
+            elif sector_relative_return >= -5:
+                relative_score += 2
+            else:
+                relative_score += 0.5
+
+    relative_score = min(relative_score, 15)
+
+    fundamental_score, fundamental_notes = _fundamental_score(info)
+
+    components = {
+        "トレンド": round(trend_score, 1),
+        "モメンタム": round(momentum_score, 1),
+        "出来高": round(volume_score, 1),
+        "相対強度": round(relative_score, 1),
+        "ファンダメンタルズ": round(fundamental_score, 1),
     }
 
-    if len(df) < 30:
-        return result
+    component_maximums = {
+        "トレンド": 30.0,
+        "モメンタム": 25.0,
+        "出来高": 10.0,
+        "相対強度": 15.0,
+        "ファンダメンタルズ": 20.0,
+    }
 
-    low = df["Low"]
-
-    swing_low = (
-        (low < low.shift(1))
-        & (low <= low.shift(2))
-        & (low < low.shift(-1))
-        & (low <= low.shift(-2))
+    total_score = round(
+        min(100.0, max(0.0, sum(components.values()))),
+        1,
     )
 
-    # 直近2本は未来側の確認がないので除外
-    swing_low.iloc[-2:] = False
+    signals: list[str] = []
 
-    positions = np.flatnonzero(swing_low.fillna(False).to_numpy())
+    if sma20 is not None:
+        if close > sma20:
+            signals.append("終値は20日移動平均線を上回っています。")
+        else:
+            signals.append("終値は20日移動平均線を下回っています。")
 
-    # 古すぎるスイングは使わない
-    positions = positions[positions >= max(0, len(df) - 120)]
+    if (
+        sma20 is not None
+        and sma50 is not None
+        and sma200 is not None
+    ):
+        if sma20 > sma50 > sma200:
+            signals.append(
+                "短期・中期・長期移動平均線は上昇配列です。"
+            )
+        elif sma20 < sma50 < sma200:
+            signals.append(
+                "短期・中期・長期移動平均線は下降配列です。"
+            )
 
-    if len(positions) < 2:
-        return result
+    if rsi is not None:
+        if rsi >= 70:
+            signals.append(
+                "RSIは70以上で、短期的な過熱に注意が必要です。"
+            )
+        elif rsi <= 30:
+            signals.append(
+                "RSIは30以下で、売られ過ぎ圏にあります。"
+            )
+        else:
+            signals.append(
+                "RSIは極端な過熱・売られ過ぎ圏にはありません。"
+            )
 
-    first_position = int(positions[-2])
-    second_position = int(positions[-1])
+    if macd is not None and macd_signal is not None:
+        if macd > macd_signal:
+            signals.append(
+                "MACDはシグナル線を上回っています。"
+            )
+        else:
+            signals.append(
+                "MACDはシグナル線を下回っています。"
+            )
 
-    first_low = float(df["Low"].iloc[first_position])
-    second_low = float(df["Low"].iloc[second_position])
+    if market_relative_return is not None:
+        signals.append(
+            "直近約3か月の市場相対リターンは"
+            f"{market_relative_return:+.1f}ポイントです。"
+        )
 
-    between_highs = df["High"].iloc[
-        first_position:second_position + 1
-    ]
+    if sector_relative_return is not None:
+        signals.append(
+            "直近約3か月のセクター相対リターンは"
+            f"{sector_relative_return:+.1f}ポイントです。"
+        )
 
-    if between_highs.empty:
-        return result
+    signals.extend(fundamental_notes)
 
-    neckline = float(between_highs.max())
-
-    higher_low = second_low > first_low
-    recent_higher_low = (
-        higher_low
-        and second_position >= len(df) - 35
+    reference = (
+        frame.iloc[:-1].tail(60)
+        if len(frame) > 1
+        else frame.tail(60)
     )
 
-    close_above = df["Close"] > neckline
-    breakout_cross = close_above & ~close_above.shift(1).fillna(False)
-    recent_breakout = bool(breakout_cross.tail(5).any())
+    support = _safe_float(reference["Low"].min())
+    resistance = _safe_float(reference["High"].max())
 
-    result.update(
-        {
-            "available": True,
-            "higher_low": higher_low,
-            "recent_higher_low": recent_higher_low,
-            "neckline_breakout": recent_higher_low and recent_breakout,
-            "first_low": first_low,
-            "second_low": second_low,
-            "neckline": neckline,
-        }
-    )
+    change = None
+    change_percent = None
 
-    return result
+    if previous_close is not None and previous_close != 0:
+        change = close - previous_close
+        change_percent = (change / previous_close) * 100
 
-
-def crossed_up_recently(
-    left: pd.Series,
-    right: pd.Series | float,
-    lookback: int = 3,
-) -> bool:
-    if isinstance(right, pd.Series):
-        crossed = (left > right) & (left.shift(1) <= right.shift(1))
-    else:
-        crossed = (left > right) & (left.shift(1) <= right)
-
-    return bool(crossed.tail(lookback).fillna(False).any())
-
-
-def _benchmark_items(
-    frame: pd.DataFrame | None,
-    category: str,
-    label_prefix: str,
-) -> list[ScoreItem]:
-    if frame is None or frame.empty or len(frame) < 55:
-        return [
-            ScoreItem(
-                category=category,
-                label=f"{label_prefix}：50日移動平均",
-                points=5,
-                passed=False,
-                available=False,
-                detail="データ不足",
-            ),
-            ScoreItem(
-                category=category,
-                label=f"{label_prefix}：1か月騰落率",
-                points=5,
-                passed=False,
-                available=False,
-                detail="データ不足",
-            ),
-        ]
-
-    close = frame["Close"]
-    ma50 = close.rolling(50).mean().iloc[-1]
-    current = close.iloc[-1]
-    month_ago = close.iloc[-22]
-
-    return [
-        ScoreItem(
-            category=category,
-            label=f"{label_prefix}：株価が50日線より上",
-            points=5,
-            passed=bool(current > ma50),
-            available=not pd.isna(ma50),
-            detail=f"終値 {current:.2f} / MA50 {ma50:.2f}",
+    latest = {
+        "date": frame.index[-1],
+        "close": close,
+        "change": change,
+        "change_percent": change_percent,
+        "sma20": sma20,
+        "sma50": sma50,
+        "sma200": sma200,
+        "rsi14": rsi,
+        "macd": macd,
+        "macd_signal": macd_signal,
+        "macd_histogram": _safe_float(
+            latest_row["MACDHistogram"]
         ),
-        ScoreItem(
-            category=category,
-            label=f"{label_prefix}：直近1か月が上昇",
-            points=5,
-            passed=bool(current > month_ago),
-            available=not pd.isna(month_ago),
-            detail=f"1か月騰落率 {(current / month_ago - 1) * 100:.1f}%",
-        ),
-    ]
+        "k": k_value,
+        "d": d_value,
+        "j": j_value,
+        "atr14": _safe_float(latest_row["ATR14"]),
+        "volume": volume,
+        "volume_average": volume_average,
+        "primary_return_3m": primary_return,
+    }
 
-
-def calculate_score(
-    df: pd.DataFrame,
-    info: dict[str, Any],
-    market_df: pd.DataFrame | None,
-    sector_df: pd.DataFrame | None,
-    market_label: str = "市場",
-    sector_label: str = "セクター",
-) -> ScoreResult:
-    items: list[ScoreItem] = []
-
-    # =========================================================
-    # 企業品質 20点
-    # =========================================================
-    revenue_growth = safe_number(info.get("revenueGrowth"))
-    operating_margin = safe_number(info.get("operatingMargins"))
-    operating_cf = safe_number(info.get("operatingCashflow"))
-    free_cf = safe_number(info.get("freeCashflow"))
-    trailing_pe = safe_number(info.get("trailingPE"))
-    forward_pe = safe_number(info.get("forwardPE"))
-
-    items.extend(
-        [
-            ScoreItem(
-                "企業品質",
-                "売上成長率がプラス",
-                4,
-                revenue_growth is not None and revenue_growth > 0,
-                revenue_growth is not None,
-                (
-                    f"{revenue_growth * 100:.1f}%"
-                    if revenue_growth is not None
-                    else "取得不可"
-                ),
-            ),
-            ScoreItem(
-                "企業品質",
-                "営業利益率が5%以上",
-                4,
-                operating_margin is not None and operating_margin >= 0.05,
-                operating_margin is not None,
-                (
-                    f"{operating_margin * 100:.1f}%"
-                    if operating_margin is not None
-                    else "取得不可"
-                ),
-            ),
-            ScoreItem(
-                "企業品質",
-                "営業キャッシュフローがプラス",
-                4,
-                operating_cf is not None and operating_cf > 0,
-                operating_cf is not None,
-                "プラス" if operating_cf and operating_cf > 0 else "取得不可またはマイナス",
-            ),
-            ScoreItem(
-                "企業品質",
-                "フリーキャッシュフローがプラス",
-                4,
-                free_cf is not None and free_cf > 0,
-                free_cf is not None,
-                "プラス" if free_cf and free_cf > 0 else "取得不可またはマイナス",
-            ),
-            ScoreItem(
-                "企業品質",
-                "予想PERが実績PERを下回る",
-                4,
-                (
-                    trailing_pe is not None
-                    and forward_pe is not None
-                    and forward_pe > 0
-                    and trailing_pe > forward_pe
-                ),
-                (
-                    trailing_pe is not None
-                    and forward_pe is not None
-                    and trailing_pe > 0
-                    and forward_pe > 0
-                ),
-                (
-                    f"実績 {trailing_pe:.1f} / 予想 {forward_pe:.1f}"
-                    if trailing_pe is not None and forward_pe is not None
-                    else "取得不可"
-                ),
-            ),
-        ]
-    )
-
-    # =========================================================
-    # 市場環境 20点
-    # =========================================================
-    items.extend(
-        _benchmark_items(
-            market_df,
-            "市場環境",
-            market_label,
-        )
-    )
-    items.extend(
-        _benchmark_items(
-            sector_df,
-            "市場環境",
-            sector_label,
-        )
-    )
-
-    # =========================================================
-    # 売られ過ぎ 20点
-    # =========================================================
-    recent10 = df.tail(10)
-    recent60 = df.tail(60)
-
-    rsi_available = recent10["RSI_14"].notna().any()
-    rsi_oversold = (
-        rsi_available
-        and recent10["RSI_14"].min() <= 30
-    )
-
-    bb_available = recent10["Lower"].notna().any()
-    bb_touch = (
-        bb_available
-        and bool((recent10["Low"] <= recent10["Lower"]).any())
-    )
-
-    sixty_high = recent60["High"].max()
-    current_close = df["Close"].iloc[-1]
-    drawdown = (
-        current_close / sixty_high - 1
-        if sixty_high and not pd.isna(sixty_high)
-        else None
-    )
-
-    ma20_distance = (
-        (df["Close"] / df["MA20"] - 1)
-        .tail(10)
-        .min()
-    )
-
-    items.extend(
-        [
-            ScoreItem(
-                "売られ過ぎ",
-                "直近10日でRSI(14)が30以下",
-                6,
-                rsi_oversold,
-                rsi_available,
-                (
-                    f"最小RSI {recent10['RSI_14'].min():.1f}"
-                    if rsi_available
-                    else "計算不可"
-                ),
-            ),
-            ScoreItem(
-                "売られ過ぎ",
-                "直近10日でボリンジャー-2σに到達",
-                6,
-                bb_touch,
-                bb_available,
-                "到達あり" if bb_touch else "到達なし",
-            ),
-            ScoreItem(
-                "売られ過ぎ",
-                "60日高値から10%以上下落",
-                4,
-                drawdown is not None and drawdown <= -0.10,
-                drawdown is not None,
-                (
-                    f"{drawdown * 100:.1f}%"
-                    if drawdown is not None
-                    else "計算不可"
-                ),
-            ),
-            ScoreItem(
-                "売られ過ぎ",
-                "直近10日で20日線から5%以上下方乖離",
-                4,
-                (
-                    ma20_distance is not None
-                    and not pd.isna(ma20_distance)
-                    and ma20_distance <= -0.05
-                ),
-                ma20_distance is not None and not pd.isna(ma20_distance),
-                (
-                    f"最大下方乖離 {ma20_distance * 100:.1f}%"
-                    if ma20_distance is not None
-                    and not pd.isna(ma20_distance)
-                    else "計算不可"
-                ),
-            ),
-        ]
-    )
-
-    # =========================================================
-    # 反転確認 40点
-    # =========================================================
-    rsi_cross = crossed_up_recently(
-        df["RSI_14"],
-        30,
-        lookback=3,
-    )
-
-    macd_cross = crossed_up_recently(
-        df["MACD"],
-        df["Signal"],
-        lookback=3,
-    )
-
-    kdj_cross_series = (
-        (df["K"] > df["D"])
-        & (df["K"].shift(1) <= df["D"].shift(1))
-        & (df["K"] < 40)
-    )
-    kdj_cross = bool(kdj_cross_series.tail(3).fillna(False).any())
-
-    recent_patterns = df.tail(3)
-    pattern_detected = bool(
-        recent_patterns["Hammer"].fillna(False).any()
-        or recent_patterns["BullishEngulfing"].fillna(False).any()
-    )
-
-    volume_confirmation = bool(
-        (
-            (df["Close"] > df["Close"].shift(1))
-            & (df["Volume"] > df["Vol_MA20"] * 1.5)
-        )
-        .tail(3)
-        .fillna(False)
-        .any()
-    )
-
-    obv_confirmation = bool(
-        not pd.isna(df["OBV_MA5"].iloc[-1])
-        and not pd.isna(df["OBV_MA20"].iloc[-1])
-        and df["OBV_MA5"].iloc[-1] > df["OBV_MA20"].iloc[-1]
-        and df["OBV_MA5"].iloc[-1] > df["OBV_MA5"].iloc[-5]
-    )
-
-    structure = detect_market_structure(df)
-
-    ma20_reclaim = crossed_up_recently(
-        df["Close"],
-        df["MA20"],
-        lookback=3,
-    )
-
-    items.extend(
-        [
-            ScoreItem(
-                "反転確認",
-                "RSIが30を上抜け",
-                6,
-                rsi_cross,
-                df["RSI_14"].notna().sum() >= 15,
-                f"現在 {df['RSI_14'].iloc[-1]:.1f}",
-            ),
-            ScoreItem(
-                "反転確認",
-                "MACDが直近3日でゴールデンクロス",
-                6,
-                macd_cross,
-                df["Signal"].notna().sum() >= 30,
-                (
-                    f"MACD {df['MACD'].iloc[-1]:.3f} / "
-                    f"Signal {df['Signal'].iloc[-1]:.3f}"
-                ),
-            ),
-            ScoreItem(
-                "反転確認",
-                "KDJが低位でゴールデンクロス",
-                4,
-                kdj_cross,
-                df["D"].notna().sum() >= 10,
-                f"K {df['K'].iloc[-1]:.1f} / D {df['D'].iloc[-1]:.1f}",
-            ),
-            ScoreItem(
-                "反転確認",
-                "ハンマーまたは強気包み足",
-                5,
-                pattern_detected,
-                len(df) >= 3,
-                "直近3日を判定",
-            ),
-            ScoreItem(
-                "反転確認",
-                "上昇日に出来高が20日平均の1.5倍",
-                5,
-                volume_confirmation,
-                df["Vol_MA20"].notna().sum() > 0,
-                "直近3日を判定",
-            ),
-            ScoreItem(
-                "反転確認",
-                "OBVの短期傾向が上向き",
-                4,
-                obv_confirmation,
-                df["OBV_MA20"].notna().sum() > 0,
-                "OBVの5日平均と20日平均を比較",
-            ),
-            ScoreItem(
-                "反転確認",
-                "確定スイング安値が切り上がった",
-                4,
-                bool(structure["recent_higher_low"]),
-                bool(structure["available"]),
-                (
-                    f"第1安値 {structure['first_low']:.2f} / "
-                    f"第2安値 {structure['second_low']:.2f}"
-                    if structure["available"]
-                    else "確定スイング安値が不足"
-                ),
-            ),
-            ScoreItem(
-                "反転確認",
-                "安値切り上げ後にネックライン突破",
-                4,
-                bool(structure["neckline_breakout"]),
-                bool(structure["available"]),
-                (
-                    f"ネックライン {structure['neckline']:.2f}"
-                    if structure["available"]
-                    else "判定不可"
-                ),
-            ),
-            ScoreItem(
-                "反転確認",
-                "終値が20日移動平均線を回復",
-                2,
-                ma20_reclaim,
-                df["MA20"].notna().sum() > 0,
-                "直近3日での上抜けを判定",
-            ),
-        ]
-    )
-
-    earned = sum(item.earned for item in items)
-    available = sum(
-        item.points for item in items if item.available
-    )
-    theoretical = sum(item.points for item in items)
-
-    normalized_score = (
-        round(earned / available * 100)
-        if available > 0
-        else None
-    )
-
-    completeness = (
-        round(available / theoretical * 100)
-        if theoretical > 0
-        else 0
-    )
-
-    categories = ["企業品質", "市場環境", "売られ過ぎ", "反転確認"]
-    category_scores: dict[str, dict[str, int | None]] = {}
-
-    for category in categories:
-        category_items = [
-            item for item in items if item.category == category
-        ]
-        category_earned = sum(item.earned for item in category_items)
-        category_available = sum(
-            item.points for item in category_items if item.available
-        )
-        category_theoretical = sum(
-            item.points for item in category_items
-        )
-
-        category_normalized = (
-            round(category_earned / category_available * 100)
-            if category_available > 0
-            else None
-        )
-
-        category_scores[category] = {
-            "earned": category_earned,
-            "available": category_available,
-            "theoretical": category_theoretical,
-            "normalized": category_normalized,
-        }
-
-    oversold_score = (
-        category_scores["売られ過ぎ"]["normalized"] or 0
-    )
-    reversal_score = (
-        category_scores["反転確認"]["normalized"] or 0
-    )
-
-    if completeness < 60:
-        status = "⚪ データ不足のため判定信頼度が低い"
-        status_color = "gray"
-    elif reversal_score >= 70:
-        status = "🟢 反転確認材料が多い"
-        status_color = "green"
-    elif reversal_score >= 45:
-        status = "🟡 初期反転を確認中"
-        status_color = "orange"
-    elif oversold_score >= 60:
-        status = "🟠 売られ過ぎだが反転は未確認"
-        status_color = "darkorange"
-    else:
-        status = "🔴 下降継続、または反転材料が不足"
-        status_color = "red"
-
-    return ScoreResult(
-        items=items,
-        earned=earned,
-        available=available,
-        theoretical=theoretical,
-        normalized_score=normalized_score,
-        completeness=completeness,
-        category_scores=category_scores,
-        status=status,
-        status_color=status_color,
+    return AnalysisResult(
+        symbol=symbol,
+        frame=frame,
+        score=total_score,
+        verdict=_verdict(total_score),
+        components=components,
+        component_maximums=component_maximums,
+        latest=latest,
+        signals=signals,
+        candlestick_patterns=_detect_candlestick_patterns(frame),
+        support=support,
+        resistance=resistance,
+        market_relative_return=market_relative_return,
+        sector_relative_return=sector_relative_return,
+        warnings=warnings,
     )
